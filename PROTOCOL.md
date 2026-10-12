@@ -1,6 +1,6 @@
 # lince protocol, version 1
 
-Clients talk to `lince serve` over a Unix stream socket (default `$XDG_RUNTIME_DIR/lince/lince.sock`). Each request is a single line of JSON, and each one gets a single line of JSON back, in order. A client can keep its connection open for as long as it likes.
+Clients talk to `lince serve` over a Unix stream socket (default `$XDG_RUNTIME_DIR/lince/lince.sock`, or `$TMPDIR/lince-$UID/lince.sock` when `XDG_RUNTIME_DIR` is unset). Each request is a single line of JSON, and each one gets a single line of JSON back, in order. A client can keep its connection open for as long as it likes.
 
 Every response carries `"v": 1`. Within a version, fields are only ever added. A client should ignore fields it does not know, and treat a different `v` as incompatible.
 

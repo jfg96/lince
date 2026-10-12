@@ -55,8 +55,8 @@ impl Args {
         }
         out
     }
-    fn socket(&self) -> PathBuf {
-        self.value("--socket").map(|s| config::expand(&s)).unwrap_or_else(config::default_socket)
+    fn socket(&self) -> Result<PathBuf, String> {
+        self.value("--socket").map(|s| Ok(config::expand(&s))).unwrap_or_else(config::default_socket)
     }
 }
 
@@ -111,7 +111,7 @@ fn cmd_search(args: &Args) -> Result<(), String> {
     };
     let limit: usize = args.value("--limit").and_then(|v| v.parse().ok()).unwrap_or(50);
     let resp = server::ask(
-        &args.socket(),
+        &args.socket()?,
         &serde_json::json!({
             "query": terms.join(" "), "kinds": kinds, "hidden": args.flag("--hidden"),
             "max_results": limit.max(1),
@@ -136,7 +136,7 @@ fn cmd_search(args: &Args) -> Result<(), String> {
 }
 
 fn cmd_status(args: &Args) -> Result<(), String> {
-    let resp = server::ask(&args.socket(), &serde_json::json!({ "op": "status" }))?;
+    let resp = server::ask(&args.socket()?, &serde_json::json!({ "op": "status" }))?;
     println!("{}", serde_json::to_string_pretty(&resp).unwrap());
     Ok(())
 }
@@ -218,7 +218,7 @@ fn run() -> Result<(), String> {
         "serve" => cmd_serve(&args),
         "search" => cmd_search(&args),
         "status" => cmd_status(&args),
-        "query" => server::client(&args.socket()),
+        "query" => server::client(&args.socket()?),
         "oneshot" => cmd_oneshot(&args),
         "stats" => cmd_stats(&args),
         "--version" | "version" => {

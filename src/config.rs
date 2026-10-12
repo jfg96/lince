@@ -65,12 +65,30 @@ pub fn expand(path: &str) -> PathBuf {
     }
 }
 
-pub fn default_socket() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("lince/lince.sock")
+pub fn default_socket() -> Result<PathBuf, String> {
+    match std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+        Some(dir) => Ok(PathBuf::from(dir).join("lince/lince.sock")),
+        None => Ok(private_temp_dir()?.join("lince.sock")),
+    }
+}
+
+/// Without XDG_RUNTIME_DIR the socket goes to a per-user directory in the
+/// shared temp dir. It must be a real directory that only we can enter:
+/// anyone could have created it first and put their own socket there.
+fn private_temp_dir() -> Result<PathBuf, String> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let uid = unsafe { libc::getuid() };
+    let dir = std::env::temp_dir().join(format!("lince-{uid}"));
+    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(format!("{}: {e}", dir.display())),
+    }
+    let meta = std::fs::symlink_metadata(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o077 != 0 {
+        return Err(format!("{}: not a private directory owned by this user", dir.display()));
+    }
+    Ok(dir)
 }
 
 pub fn config_path() -> PathBuf {
@@ -121,7 +139,10 @@ pub fn load(o: Overrides) -> Result<Config, String> {
         .map(|s| expand(&s))
         .unwrap_or_else(|| snapshot_for(&roots, &excludes));
     Ok(Config {
-        socket: o.socket.or(file.socket).map(|s| expand(&s)).unwrap_or_else(default_socket),
+        socket: match o.socket.or(file.socket) {
+            Some(s) => expand(&s),
+            None => default_socket()?,
+        },
         watch: !o.no_watch && file.watch.unwrap_or(true),
         exit_with_parent: o.exit_with_parent,
         roots,
