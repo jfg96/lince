@@ -1,0 +1,17 @@
+# Run lince for the whole session, shared by every client.
+#   install -Dm644 contrib/systemd/lince.service ~/.config/systemd/user/lince.service
+#   systemctl --user enable --now lince
+# Adjust ExecStart if lince is not in ~/.local/bin (e.g. /usr/bin/lince).
+[Unit]
+Description=lince filename index
+Documentation=https://github.com/jfg96/lince
+
+[Service]
+ExecStart=%h/.local/bin/lince serve
+Restart=on-failure
+# Indexing is background work: stay out of the way of interactive tasks.
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=default.target

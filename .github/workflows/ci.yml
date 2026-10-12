@@ -1,0 +1,20 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --release --locked -- -D warnings
+      - run: cargo test --release --locked
+      - run: cargo build --release --locked
+      - run: bash tests/cli_test.sh target/release/lince
+      - run: python3 tests/stress_updates.py target/release/lince 2000

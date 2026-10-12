@@ -1,0 +1,34 @@
+name: Release
+
+# Push a tag like v0.1.0 to publish target/release/lince with its SHA-256.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # An older runner links against an older glibc, so the binary runs on
+    # any current distribution. (musl is not used: its allocator makes the
+    # parallel crawl about 7x slower.)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --release --locked
+      - run: bash tests/cli_test.sh target/release/lince
+      - name: Package
+        run: |
+          name=lince-${GITHUB_REF_NAME}-x86_64-linux
+          mkdir "$name"
+          cp target/release/lince README.md PROTOCOL.md LICENSE "$name/"
+          cp -r contrib "$name/"
+          tar czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            lince-*.tar.gz
+            lince-*.tar.gz.sha256

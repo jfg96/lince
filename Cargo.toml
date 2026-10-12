@@ -1,0 +1,27 @@
+[package]
+name = "lince"
+version = "0.1.0"
+edition = "2021"
+description = "Resident filename index for Linux desktops: inotify-fresh, millisecond searches over a Unix socket"
+license = "MIT"
+rust-version = "1.85"
+repository = "https://github.com/jfg96/lince"
+readme = "README.md"
+
+[[bin]]
+name = "lince"
+path = "src/main.rs"
+
+[dependencies]
+ignore = "0.4"
+libc = "0.2"
+memchr = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+unicode-normalization = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
