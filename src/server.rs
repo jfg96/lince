@@ -44,11 +44,36 @@ fn already_running(socket: &Path) -> bool {
     UnixStream::connect(socket).is_ok()
 }
 
-fn bind(socket: &Path) -> Result<UnixListener, String> {
-    let _ = std::fs::remove_file(socket);
+/// Takes the lock that makes this the only daemon on `socket`, held until
+/// exit. Without it, two daemons started together would both index and the
+/// second would replace the first one's socket. None if another holds it.
+fn lock(socket: &Path) -> Result<Option<std::fs::File>, String> {
+    use std::os::unix::fs::OpenOptionsExt;
     if let Some(dir) = socket.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
+    let path = socket.with_extension("lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(None);
+        }
+        return Err(format!("{}: {e}", path.display()));
+    }
+    Ok(Some(file))
+}
+
+fn bind(socket: &Path) -> Result<UnixListener, String> {
+    // Holding the lock, any socket left here belongs to a daemon that died.
+    let _ = std::fs::remove_file(socket);
     let listener = UnixListener::bind(socket).map_err(|e| format!("{}: {e}", socket.display()))?;
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
     Ok(listener)
@@ -110,6 +135,11 @@ fn status_json(index: &Index, watcher: &Option<Watcher>) -> String {
 }
 
 pub fn serve(cfg: Config) -> Result<(), String> {
+    let Some(_lock) = lock(&cfg.socket)? else {
+        log(&format!("already running on {}", cfg.socket.display()));
+        return Ok(());
+    };
+    // A daemon from before the lock existed answers without holding it.
     if already_running(&cfg.socket) {
         log(&format!("already running on {}", cfg.socket.display()));
         return Ok(());

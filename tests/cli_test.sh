@@ -72,6 +72,11 @@ check contains "$("$bin" oneshot --root "$home" --root "$other" --query fresh-re
 
 # Daemon round trip.
 sock="$work/lince.sock"
+# While another daemon holds the lock (here still indexing), serve leaves.
+second=0
+flock "$work/lince.lock" timeout 5 "$bin" serve --socket "$sock" --root "$home" --snapshot "$work/s.lnc" 2>/dev/null || second=$?
+check test "$second" == 0
+check test ! -e "$sock"
 "$bin" serve --socket "$sock" --root "$home" --root "$other" --exclude node_modules --snapshot "$work/s.lnc" 2>/dev/null &
 daemon=$!
 for _ in {1..200}; do [[ -S $sock ]] && break; sleep 0.02; done
