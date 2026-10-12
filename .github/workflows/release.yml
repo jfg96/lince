@@ -28,8 +28,13 @@ jobs:
           cp -r contrib "$name/"
           tar czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          # The bare binary too, for launchers that pin its size and SHA-256.
+          rm -rf "$name"
+          cp target/release/lince "$name"
+          sha256sum "$name" > "$name.sha256"
       - uses: softprops/action-gh-release@v2
         with:
           files: |
+            lince-*-x86_64-linux
+            lince-*.sha256
             lince-*.tar.gz
-            lince-*.tar.gz.sha256
