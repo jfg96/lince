@@ -1,6 +1,6 @@
 [package]
 name = "lince"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Resident filename index for Linux desktops: inotify-fresh, millisecond searches over a Unix socket"
 license = "MIT"
