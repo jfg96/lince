@@ -19,6 +19,13 @@ use crate::query::{self, Request};
 use crate::watch::Watcher;
 use crate::{persist, threads};
 
+/// A client that leaves a response unread this long is dropped, so it cannot
+/// stall the loop that serves everyone else.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+/// Requests are a few hundred bytes; a client sending this much without a
+/// newline is not speaking the protocol.
+const MAX_PENDING: usize = 1 << 20;
+
 struct Client {
     stream: UnixStream,
     buf: Vec<u8>,
@@ -205,6 +212,7 @@ pub fn serve(cfg: Config) -> Result<(), String> {
         if fds[0].revents != 0 {
             while let Ok((stream, _)) = listener.accept() {
                 let _ = stream.set_nonblocking(true);
+                let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
                 clients.push(Client { stream, buf: Vec::new() });
             }
         }
@@ -220,6 +228,11 @@ pub fn serve(cfg: Config) -> Result<(), String> {
                 match client.stream.read(&mut chunk) {
                     Ok(0) => {
                         closed.push(i);
+                        break;
+                    }
+                    Ok(n) if client.buf.len() + n > MAX_PENDING => {
+                        closed.push(i);
+                        client.buf.clear();
                         break;
                     }
                     Ok(n) => client.buf.extend_from_slice(&chunk[..n]),
@@ -240,6 +253,8 @@ pub fn serve(cfg: Config) -> Result<(), String> {
                 out.push_str(&handle_line(line, newest, &mut index, &mut watcher));
                 out.push('\n');
             }
+            // Blocking up to WRITE_TIMEOUT; a timeout leaves half a response
+            // behind, so the client is dropped rather than retried.
             let _ = client.stream.set_nonblocking(false);
             if client.stream.write_all(out.as_bytes()).is_err() {
                 closed.push(i);
