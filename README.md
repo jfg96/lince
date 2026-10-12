@@ -49,7 +49,7 @@ install -Dm644 contrib/systemd/lince.service ~/.config/systemd/user/lince.servic
 systemctl --user enable --now lince
 ```
 
-A second `lince serve` on the same socket exits immediately, so clients can always try to start one.
+A second `lince serve` on the same socket exits immediately, so clients can always try to start one. A client that starts the daemon itself can pass `--exit-with-parent` and keep the daemon's stdin open: lince exits when it reads end-of-file, so it never outlives the client.
 
 ### Configuration
 

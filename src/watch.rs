@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::ffi::{CString, OsStr};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use crate::index::{crawl, DirHook, Index, Kind};
@@ -32,8 +33,9 @@ pub struct Watcher {
     dir_wd: HashMap<u32, i32>,
     added: Mutex<Vec<(i32, u32)>>,
     /// Set when inotify refused a watch (usually max_user_watches): the index
-    /// can no longer promise freshness and clients should know.
-    pub degraded: Mutex<bool>,
+    /// can no longer promise freshness and clients should know. It stays set:
+    /// the directories that were refused are not retried.
+    pub degraded: AtomicBool,
 }
 
 #[derive(Default, Debug)]
@@ -48,7 +50,7 @@ impl DirHook for Watcher {
         let wd = unsafe { libc::inotify_add_watch(self.fd, c.as_ptr(), MASK) };
         if wd < 0 {
             if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOSPC) {
-                *self.degraded.lock().unwrap() = true;
+                self.degraded.store(true, Ordering::Relaxed);
             }
             return;
         }
@@ -67,7 +69,7 @@ impl Watcher {
             wd_dir: HashMap::new(),
             dir_wd: HashMap::new(),
             added: Mutex::new(Vec::new()),
-            degraded: Mutex::new(false),
+            degraded: AtomicBool::new(false),
         })
     }
 
@@ -237,5 +239,48 @@ impl Watcher {
 impl Drop for Watcher {
     fn drop(&mut self) {
         unsafe { libc::close(self.fd) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::build;
+    use crate::index::tests::tempdir;
+
+    fn lookup(index: &Index, rel: &str) -> Option<u32> {
+        rel.split('/').try_fold(index.roots[0].id, |dir, part| index.child_by_name(dir, part.as_bytes()))
+    }
+
+    #[test]
+    fn applies_changes_made_after_the_crawl() {
+        let dir = tempdir::Dir::new();
+        std::fs::create_dir_all(dir.0.join("a/sub")).unwrap();
+        std::fs::write(dir.0.join("a/sub/old.txt"), b"").unwrap();
+        std::fs::write(dir.0.join("gone.txt"), b"").unwrap();
+        let mut w = Watcher::new().unwrap();
+        let mut index = build(&[dir.0.clone()], &[], 2, &w).unwrap();
+        w.commit();
+
+        std::fs::write(dir.0.join("a/new.txt"), b"").unwrap();
+        w.drain(&mut index, 2);
+        // A new directory tree: its contents arrive before it is watched.
+        std::fs::create_dir_all(dir.0.join("b/c")).unwrap();
+        std::fs::write(dir.0.join("b/c/deep.txt"), b"").unwrap();
+        std::fs::rename(dir.0.join("a"), dir.0.join("z")).unwrap();
+        std::fs::remove_file(dir.0.join("gone.txt")).unwrap();
+        let applied = w.drain(&mut index, 2);
+
+        assert!(applied.events == 4 && !applied.overflow);
+        assert!(lookup(&index, "z/new.txt").is_some());
+        assert!(lookup(&index, "z/sub/old.txt").is_some());
+        assert!(lookup(&index, "a").is_none());
+        assert!(lookup(&index, "b/c/deep.txt").is_some());
+        assert!(lookup(&index, "gone.txt").is_none());
+        // The moved subtree keeps its watch under the new name.
+        std::fs::write(dir.0.join("z/sub/later.txt"), b"").unwrap();
+        w.drain(&mut index, 2);
+        assert!(lookup(&index, "z/sub/later.txt").is_some());
+        assert!(!w.degraded.load(Ordering::Relaxed));
     }
 }

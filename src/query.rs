@@ -16,7 +16,6 @@
 //! there are more than `max_results`, the best-ranked ones are kept.
 
 use std::collections::HashMap;
-use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use memchr::memmem::Finder;
@@ -676,10 +675,6 @@ fn mtime_ms(path: &Path) -> Option<f64> {
     Some(meta.mtime() as f64 * 1000.0)
 }
 
-fn path_string(path: &Path) -> String {
-    String::from_utf8_lossy(path.as_os_str().as_bytes()).into_owned()
-}
-
 pub fn search(index: &Index, req: &Request) -> Result<Response, String> {
     let start = std::time::Instant::now();
     let compiled = compile(index, req)?;
@@ -701,7 +696,9 @@ pub fn search(index: &Index, req: &Request) -> Result<Response, String> {
         let out = if kind == Kind::Dir { &mut resp.dirs } else { &mut resp.files };
         for id in ids {
             let path = index.path(id);
-            let text = path_string(&path);
+            // JSON strings cannot carry these bytes, and a lossy copy would
+            // name a file that does not exist.
+            let Some(text) = path.to_str().map(str::to_owned) else { continue };
             if stat_budget > 0 {
                 stat_budget -= 1;
                 if let Some(ms) = mtime_ms(&path) {
@@ -719,4 +716,71 @@ pub fn search(index: &Index, req: &Request) -> Result<Response, String> {
     }
     resp.engine_us = start.elapsed().as_micros() as u64;
     Ok(resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::tests::tempdir;
+    use crate::index::{build, NoHook};
+
+    fn files(dir: &tempdir::Dir, names: &[&[u8]]) -> Index {
+        use std::os::unix::ffi::OsStrExt;
+        for name in names {
+            let path = dir.0.join(std::ffi::OsStr::from_bytes(name));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"").unwrap();
+        }
+        build(&[dir.0.clone()], &[], 2, &NoHook).unwrap()
+    }
+
+    fn kept(index: &Index, query: &str, max: usize) -> Vec<String> {
+        let req: Request =
+            serde_json::from_value(serde_json::json!({ "query": query, "kinds": ["f"], "max_results": max })).unwrap();
+        let root = index.roots[0].path.to_str().unwrap().to_owned() + "/";
+        let mut out: Vec<String> =
+            search(index, &req).unwrap().files.iter().map(|p| p.strip_prefix(&root).unwrap().to_owned()).collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn utf16_lengths() {
+        assert_eq!(utf16_len(b"report"), 6);
+        assert_eq!(utf16_len("canción".as_bytes()), 7);
+        assert_eq!(utf16_len("a😀".as_bytes()), 3);
+    }
+
+    #[test]
+    fn keeps_the_best_scores() {
+        let dir = tempdir::Dir::new();
+        // Scores 0 to 4: equal, prefix, word start, substring, path component.
+        let ranked = ["x/report", "x/report-old.txt", "x/old-report.txt", "x/myreport.txt", "reports/notes.txt"];
+        let index = files(&dir, &ranked.map(str::as_bytes));
+        for max in 1..=ranked.len() {
+            let mut want: Vec<String> = ranked[..max].iter().map(|s| s.to_string()).collect();
+            want.sort();
+            assert_eq!(kept(&index, "report", max), want, "max_results {max}");
+        }
+    }
+
+    #[test]
+    fn equal_scores_keep_the_shorter_name_in_utf16() {
+        let dir = tempdir::Dir::new();
+        // Both are prefix matches. "report-ññ" is longer in bytes (11 vs 10)
+        // but shorter in UTF-16 code units (9 vs 10).
+        let index = files(&dir, &["report-ññ".as_bytes(), b"report-abc"]);
+        assert_eq!(kept(&index, "report", 1), ["report-ññ"]);
+    }
+
+    #[test]
+    fn non_utf8_paths_are_left_out() {
+        let dir = tempdir::Dir::new();
+        let index = files(&dir, &[b"report-\xff", b"report-ok"]);
+        let req: Request = serde_json::from_value(serde_json::json!({ "query": "report", "kinds": ["f"] })).unwrap();
+        let resp = search(&index, &req).unwrap();
+        assert_eq!(resp.files.len(), 1);
+        assert!(resp.files[0].ends_with("/report-ok"));
+        assert_eq!(resp.matched_files, 2);
+    }
 }

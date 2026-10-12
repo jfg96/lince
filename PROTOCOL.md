@@ -32,7 +32,7 @@ Response:
  "generation":313871,"fresh":true}
 ```
 
-- `dirs` and `files` are absolute paths, at most `max_results` of each, in no particular order. Sort them on the client.
+- `dirs` and `files` are absolute paths, at most `max_results` of each, in no particular order. Sort them on the client. Paths that are not valid UTF-8 cannot be sent as JSON strings and are left out, though `matched_*` still counts them.
 - `matched_*` counts every match, including any that were cut by `max_results`.
 - `mtimes` maps a path to milliseconds since the epoch.
 - `fresh` is `false` when changes may be missing (the daemon runs without a watcher, or inotify ran out of watches). A client that needs certainty should then walk the disk itself.

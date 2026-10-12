@@ -11,6 +11,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
@@ -124,7 +125,7 @@ fn status_json(index: &Index, watcher: &Option<Watcher>) -> String {
         .ok()
         .and_then(|s| s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)?.parse().ok()))
         .unwrap_or(0);
-    let degraded = watcher.as_ref().is_none_or(|w| *w.degraded.lock().unwrap());
+    let degraded = watcher.as_ref().is_none_or(|w| w.degraded.load(Ordering::Relaxed));
     serde_json::json!({
         "v": query::PROTOCOL,
         "version": env!("CARGO_PKG_VERSION"),
@@ -311,7 +312,7 @@ fn handle_line(line: &[u8], newest: bool, index: &mut Index, watcher: &mut Optio
     }
     match query::search(index, &req) {
         Ok(mut resp) => {
-            resp.fresh = watcher.as_ref().is_some_and(|w| !*w.degraded.lock().unwrap());
+            resp.fresh = watcher.as_ref().is_some_and(|w| !w.degraded.load(Ordering::Relaxed));
             serde_json::to_string(&resp).unwrap()
         }
         Err(e) => format!("{{\"v\":{},\"id\":{},\"error\":{}}}", query::PROTOCOL, req.id, serde_json::to_string(&e).unwrap()),
@@ -343,4 +344,41 @@ pub fn ask(socket: &Path, request: &serde_json::Value) -> Result<serde_json::Val
     let mut resp = String::new();
     BufReader::new(stream).read_line(&mut resp).map_err(|e| e.to_string())?;
     serde_json::from_str(&resp).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::tests::tempdir;
+
+    fn answer(line: &str, newest: bool, index: &mut Index) -> serde_json::Value {
+        serde_json::from_str(&handle_line(line.as_bytes(), newest, index, &mut None)).unwrap()
+    }
+
+    #[test]
+    fn answers_each_kind_of_request() {
+        let dir = tempdir::Dir::new();
+        std::fs::write(dir.0.join("note.txt"), b"").unwrap();
+        let mut index = index::build(&[dir.0.clone()], &[], 1, &NoHook).unwrap();
+
+        let found = answer(r#"{"id":3,"query":"note"}"#, true, &mut index);
+        assert_eq!(found["id"], 3);
+        assert_eq!(found["files"][0], dir.0.join("note.txt").to_str().unwrap());
+        assert_eq!(found["fresh"], false, "no watcher, no freshness promise");
+        assert_eq!(answer(r#"{"id":4,"query":"note"}"#, false, &mut index)["superseded"], true);
+        assert_eq!(answer(r#"{"op":"status"}"#, true, &mut index)["entries"], 1);
+        assert!(answer(r#"{"id":5,"op":"nope"}"#, true, &mut index)["error"].as_str().unwrap().contains("unknown op"));
+        assert!(answer("not json", true, &mut index)["error"].is_string());
+    }
+
+    #[test]
+    fn one_lock_per_socket() {
+        let dir = tempdir::Dir::new();
+        let socket = dir.0.join("run/lince.sock");
+        let first = lock(&socket).unwrap();
+        assert!(first.is_some());
+        assert!(lock(&socket).unwrap().is_none());
+        drop(first);
+        assert!(lock(&socket).unwrap().is_some());
+    }
 }

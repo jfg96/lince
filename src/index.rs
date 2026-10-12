@@ -668,7 +668,7 @@ pub fn build(roots: &[PathBuf], patterns: &[String], threads: usize, hook: &dyn 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn fixture() -> (tempdir::Dir, Index) {
