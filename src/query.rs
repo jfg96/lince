@@ -100,7 +100,7 @@ struct Term {
 
 pub struct Compiled {
     terms: Vec<Term>,
-    /// Folded terms as FindBackend.scoreItem sees them (not deduplicated).
+    /// Folded terms for ranking; not deduplicated, a repeated term counts twice.
     score_terms: Vec<Term>,
     browse: bool,
     any_slash: bool,
@@ -514,13 +514,12 @@ impl<'a> Scan<'a> {
         (found, matched)
     }
 
-    /// Keeps the `max` candidates FindBackend.rankResults would put first:
-    /// score, user files before hidden ones, shorter name. Ties beyond that
-    /// keep index order, so the choice is deterministic.
+    /// Keeps the `max` best-ranked candidates (PROTOCOL.md, *Ranking*):
+    /// score, user files before hidden ones, shorter name, then path.
     fn keep_best(&mut self, found: &mut Vec<u32>, max: usize) {
         let index = self.index;
         let browse = self.q.browse;
-        // rankResults order, packed into one integer: score (or depth when
+        // Ranking order, packed into one integer: score (or depth when
         // browsing), user files before hidden ones, shorter names first.
         let pack = move |score: u32, hidden: u8, len: u32| -> u64 {
             let (a, b) = if browse { (hidden as u64, score as u64) } else { (score as u64, hidden as u64) };
@@ -528,7 +527,7 @@ impl<'a> Scan<'a> {
         };
         // First pass without building paths: exact when every term occurs in
         // the name, otherwise a lower bound (a term found only in the path
-        // scores at least 4, rankResults' best path score).
+        // scores at least 4, the best path score).
         let this = &*self;
         let parts: Vec<Vec<(u64, u32, bool)>> = std::thread::scope(|s| {
             let handles: Vec<_> = found
@@ -567,7 +566,7 @@ impl<'a> Scan<'a> {
         let mut keyed: Vec<(u64, u32, bool)> = parts.into_iter().flatten().collect();
         // Refine bounds that could still make the cut until the cut is made
         // of exact keys only. Keys only grow, so the boundary only moves up.
-        // Folded absolute path prefix of each root, as rankResults sees paths.
+        // Folded absolute path prefix of each root: path scores see full paths.
         let root_folded: Vec<Vec<u8>> = index
             .roots
             .iter()
@@ -598,8 +597,8 @@ impl<'a> Scan<'a> {
         }
         let boundary = keyed[max - 1].0;
         let mut keep: Vec<u32> = keyed.iter().filter(|k| k.0 < boundary).map(|k| k.1).collect();
-        // Entries tied with the boundary are decided like rankResults does:
-        // by path for queries, by (lowercased, here folded) name when
+        // Entries tied with the boundary are decided by the protocol's last
+        // keys: by path for queries, by folded name and then path when
         // browsing. The kept set never depends on crawl order.
         let mut tied: Vec<u32> = keyed.iter().filter(|k| k.0 == boundary).map(|k| k.1).collect();
         let utf16_path = |id: u32| -> Vec<u16> { index.path(id).to_string_lossy().encode_utf16().collect() };
@@ -618,7 +617,7 @@ impl<'a> Scan<'a> {
     }
 }
 
-/// Length of a UTF-8 name in UTF-16 code units (JavaScript's .length).
+/// Length of a UTF-8 name in UTF-16 code units, the unit the protocol ranks by.
 fn utf16_len(name: &[u8]) -> u32 {
     name.iter().map(|&b| match b {
         0x80..=0xbf => 0, // continuation byte
@@ -639,9 +638,8 @@ fn score_term(name: &[u8], term: &Term) -> i32 {
     }
 }
 
-/// Port of FindBackend.scoreItem (lower is better). The JS version returns -1
-/// for items that miss a term; those cannot reach this point, so they are
-/// ranked last instead.
+/// Score of an entry (lower is better), as PROTOCOL.md defines it. An entry
+/// that misses a term cannot reach this point; if one did, it would rank last.
 fn score_item(name: &[u8], path: &[u8], terms: &[Term]) -> u32 {
     let mut total = 0u32;
     let mut probe = Vec::new();

@@ -1,9 +1,8 @@
 //! Name folding used for matching.
 //!
 //! Every name is folded once, when it enters the index, so queries compare
-//! plain bytes. Folding lowercases and strips combining accents, the same
-//! normalisation FindBackend.js applies before ranking (`stripAccents`), so
-//! "cancion" matches "Canción" and the decomposed (NFD) spelling of it alike.
+//! plain bytes. Folding lowercases and strips combining accents after NFD
+//! normalisation (PROTOCOL.md, *Matching*), so "cancion" matches "Canción" and the decomposed (NFD) spelling of it alike.
 //!
 //! Most names are ASCII. Those take a byte-table fast path and never touch
 //! the Unicode tables.
