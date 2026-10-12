@@ -121,31 +121,35 @@ impl Watcher {
 
     /// `threads` is 1 for IN_CREATE (a new directory is nearly always empty)
     /// and the full pool when a directory moves in from outside the tree.
-    fn add(&mut self, index: &mut Index, dir: u32, name: &[u8], is_dir: bool, threads: usize) {
+    /// Adds what is now on disk at `name` in `dir`. False when nothing is
+    /// there: it was removed or moved, or a queued event has yet to move one
+    /// of its ancestors in the index to where it now is.
+    #[must_use]
+    fn add(&mut self, index: &mut Index, dir: u32, name: &[u8], threads: usize) -> bool {
         let path = index.path(dir).join(OsStr::from_bytes(name));
-        let kind = if is_dir {
-            Kind::Dir
-        } else {
-            match std::fs::symlink_metadata(&path) {
-                Ok(m) if m.file_type().is_file() => Kind::File,
-                _ => return, // symlink, fifo… or already gone
-            }
+        let kind = match std::fs::symlink_metadata(&path) {
+            Ok(m) if m.is_dir() => Kind::Dir,
+            Ok(m) if m.is_file() => Kind::File,
+            Ok(_) => return true, // symlink, fifo…: never indexed
+            Err(_) => return false,
         };
+        let is_dir = kind == Kind::Dir;
         if let Some(existing) = index.child_by_name(dir, name) {
             if index.entries[existing as usize].kind == kind {
-                return;
+                return true;
             }
             let gone = index.remove(existing);
             self.forget(&gone);
         }
         if index.is_excluded(&path, is_dir) {
-            return;
+            return true;
         }
         let id = index.add_child(dir, name, kind);
-        if kind == Kind::Dir {
+        if is_dir {
             crawl(index, vec![(id, path)], threads, self);
             self.commit();
         }
+        true
     }
 
     fn remove(&mut self, index: &mut Index, dir: u32, name: &[u8]) {
@@ -155,9 +159,10 @@ impl Watcher {
         }
     }
 
-    fn rename(&mut self, index: &mut Index, from: (u32, Vec<u8>), to: (u32, &[u8]), is_dir: bool, threads: usize) {
+    /// False like `add` when the destination had to be added and was gone.
+    fn rename(&mut self, index: &mut Index, from: (u32, Vec<u8>), to: (u32, &[u8]), is_dir: bool, threads: usize) -> bool {
         let Some(id) = index.child_by_name(from.0, &from.1) else {
-            return self.add(index, to.0, to.1, is_dir, threads);
+            return self.add(index, to.0, to.1, threads);
         };
         if let Some(existing) = index.child_by_name(to.0, to.1) {
             if existing != id {
@@ -169,9 +174,10 @@ impl Watcher {
         if index.is_excluded(&path, is_dir) {
             let gone = index.remove(id);
             self.forget(&gone);
-            return;
+            return true;
         }
         index.rename(id, to.0, to.1);
+        true
     }
 
     /// Reads and applies every queued event. Returns what happened.
@@ -179,6 +185,11 @@ impl Watcher {
         let mut applied = Applied::default();
         let mut buf = vec![0u8; 64 * 1024];
         let mut moved_from: HashMap<u32, (u32, Vec<u8>, bool)> = HashMap::new();
+        // Adds that found nothing on disk. If an ancestor was renamed after
+        // the entry appeared, the rename's events were queued before the
+        // failed stat, so this drain applies them; retrying at the end looks
+        // in the right place.
+        let mut missing: Vec<(u32, Vec<u8>)> = Vec::new();
         loop {
             let n = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
             if n <= 0 {
@@ -209,17 +220,22 @@ impl Watcher {
                 }
                 let is_dir = ev.mask & libc::IN_ISDIR != 0;
                 if ev.mask & libc::IN_CREATE != 0 {
-                    self.add(index, dir, name, is_dir, 1);
+                    if !self.add(index, dir, name, 1) {
+                        missing.push((dir, name.to_vec()));
+                    }
                 } else if ev.mask & libc::IN_DELETE != 0 {
                     self.remove(index, dir, name);
                 } else if ev.mask & libc::IN_MOVED_FROM != 0 {
                     moved_from.insert(ev.cookie, (dir, name.to_vec(), is_dir));
                 } else if ev.mask & libc::IN_MOVED_TO != 0 {
-                    match moved_from.remove(&ev.cookie) {
+                    let found = match moved_from.remove(&ev.cookie) {
                         Some((from_dir, from_name, _)) => {
                             self.rename(index, (from_dir, from_name), (dir, name), is_dir, threads)
                         }
-                        None => self.add(index, dir, name, is_dir, threads),
+                        None => self.add(index, dir, name, threads),
+                    };
+                    if !found {
+                        missing.push((dir, name.to_vec()));
                     }
                 }
             }
@@ -230,6 +246,12 @@ impl Watcher {
         for (_, (dir, name, _)) in moved_from {
             if index.entries[dir as usize].kind == Kind::Dir {
                 self.remove(index, dir, &name);
+            }
+        }
+        for (dir, name) in missing {
+            if index.entries[dir as usize].kind == Kind::Dir {
+                // Still nothing there: it is gone, and its own events say so.
+                let _ = self.add(index, dir, &name, threads);
             }
         }
         applied
@@ -282,5 +304,28 @@ mod tests {
         w.drain(&mut index, 2);
         assert!(lookup(&index, "z/sub/later.txt").is_some());
         assert!(!w.degraded.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn keeps_entries_created_just_before_a_parent_rename() {
+        let dir = tempdir::Dir::new();
+        std::fs::create_dir_all(dir.0.join("a")).unwrap();
+        let mut w = Watcher::new().unwrap();
+        let mut index = build(&[dir.0.clone()], &[], 2, &w).unwrap();
+        w.commit();
+
+        // All queued before one drain: the creations are applied while the
+        // index still calls the directory "a".
+        std::fs::write(dir.0.join("a/new.txt"), b"").unwrap();
+        std::fs::create_dir_all(dir.0.join("a/sub")).unwrap();
+        std::fs::write(dir.0.join("a/sub/inner.txt"), b"").unwrap();
+        std::fs::rename(dir.0.join("a"), dir.0.join("z")).unwrap();
+        w.drain(&mut index, 2);
+
+        assert!(lookup(&index, "z/new.txt").is_some());
+        assert!(lookup(&index, "z/sub/inner.txt").is_some());
+        std::fs::write(dir.0.join("z/sub/later.txt"), b"").unwrap();
+        w.drain(&mut index, 2);
+        assert!(lookup(&index, "z/sub/later.txt").is_some(), "the new directory is watched");
     }
 }
