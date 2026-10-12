@@ -16,7 +16,7 @@ $ lince search hypr config
 - **Ranked:** when there are more matches than the client asked for, it keeps the best ones, not whichever came first.
 - **Light:** about 40 MB resident for 300k entries, no CPU when idle, and a 5.6 MB snapshot that restarts it in about 120 ms.
 
-Used by [Omarchy Find](https://github.com/jfg96/omarchy-find), which falls back to `fd` when lince is not installed.
+Used by [Omarchy Find](https://github.com/jfg96/omarchy-find), which fetches a pinned, checksum-verified lince release on first use and falls back to `fd` while lince is unavailable.
 
 ## Install
 
