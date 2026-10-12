@@ -15,7 +15,7 @@ jobs:
     # parallel crawl about 7x slower.)
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --release --locked
       - run: bash tests/cli_test.sh target/release/lince
