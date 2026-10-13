@@ -9,7 +9,7 @@ $ lince search hypr config
 …
 ```
 
-- **Fast:** about 3–4 ms per search on a 314k-entry home, and 12 ms on a million entries (details below).
+- **Fast:** about 3 ms per search on a 315k-entry home, and 10 ms on a million entries (details below).
 - **Fresh:** every directory is watched. Changes made before a search are always in its results, and a lost-event overflow is repaired automatically.
 - **Accent- and case-insensitive:** `cancion` finds `Canción`, `españa` finds `espana`, and names stored in NFD match too.
 - **Name, path and fuzzy passes**, plus filters for kind, extension, hidden files, roots, scopes, depth and gitignore-style excludes.
@@ -83,18 +83,28 @@ echo '{"query":"report","kinds":["f"],"extensions":["pdf"],"max_results":20}' | 
 
 ## Performance
 
-Measured on a 28-thread laptop with btrfs and a warm cache. Each figure is the median over 72 (query, category) cases. The scripts and raw results are in Omarchy Find's `bench/` directory.
+Measured on an Intel i7-14700HX laptop (28 logical CPUs), btrfs, warm cache. lince uses eight query workers by default. The paired 65-case suite compares the current engine with commit `bbd853e` (0.1.1) on identical frozen indices:
 
-| | fd (walk per search) | FSearch 0.3.2 | lince |
+| Entries | Previous engine | Current engine | CPU per search (previous → current) |
 |---|---:|---:|---:|
-| 314k-entry home: search | 109 ms | 3.3 ms | 3.7 ms |
-| home: CPU per search | 1349 ms | 36 ms | 10 ms |
-| home: build | — | 650 ms | 110 ms |
-| home: resident memory | — | 51–68 MB | 38–50 MB |
-| 964k entries: search | 108 ms | 14 ms | 12 ms |
-| 964k entries: CPU per search | 1798 ms | 204 ms | 34 ms |
+| 97,453 synthetic | 2.19 ms | **1.79 ms** | 7.00 → 5.17 ms |
+| 315,143 home mirror | 3.76 ms | **3.00 ms** | 11.50 → 8.67 ms |
+| 964,036 synthetic | 12.73 ms | **9.57 ms** | 40.67 → 30.00 ms |
 
-Whenever fd stays under its result cap, lince returns exactly fd's candidates; above the cap, lince keeps the best-ranked ones. FSearch only matches names (no path pass, no fuzzy fallback, no accent folding), so its result sets are smaller.
+Every measured response preserves the exact result arrays and match counts: **195/195 cases**. Workers are reused across requests, blob hits reuse an owner cursor, and boundary ties are partitioned instead of fully sorted. The protocol and snapshot format are unchanged.
+
+A separate 60-case query/category benchmark compares FSearch 0.3.2 with the current lince engine:
+
+| | FSearch | lince, including socket and JSON |
+|---|---:|---:|
+| 315k home mirror: search | 4.28 ms | **2.41 ms** |
+| home: CPU per search | 43.51 ms | **7.00 ms** |
+| 964k synthetic: search | 14.90 ms | **9.89 ms** |
+| synthetic: CPU per search | 204.83 ms | **25.50 ms** |
+
+These operational cases use each engine's matching behavior and can return different candidates. A separate full-path suite verifies identical candidate sets in 60/60 cases; its medians are 9.83 vs 4.05 ms on the home mirror and 27.29 vs 12.33 ms on the synthetic tree. FSearch uses 28 workers and returns name-sorted references; lince selects up to 2,000 results per kind by relevance and emits paths as JSON. Some directory-only queries remain faster with FSearch.
+
+[Benchmark methods, reproduction commands and per-case data](bench/README.md). The earlier comparison with the fd walk remains available in [Omarchy Find's benchmarks](https://github.com/jfg96/omarchy-find/tree/main/bench).
 
 ## Limits
 

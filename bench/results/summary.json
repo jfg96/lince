@@ -1,0 +1,262 @@
+{
+  "fsearch_version": "0.3.2",
+  "warm_cache": true,
+  "default_threads": {
+    "fsearch": 28,
+    "lince": 8
+  },
+  "operational": {
+    "mirror": {
+      "fsearch_median_ms": 4.2795000000000005,
+      "index_median_ms": 2.409362499975032,
+      "index_engine_median_ms": 2.29575,
+      "fsearch_max_ms": 11.62,
+      "index_max_ms": 18.933285000002797,
+      "fsearch_cpu_median_ms": 43.510000000000005,
+      "index_cpu_median_ms": 7.0,
+      "fsearch_log": "build_ms=655.6 build_cpu_ms=1462.3 rss_kib=51280 rss_delta_kib=42968\nfinal_rss_kib=67896\n",
+      "index_ready_ms": 129.0233330000774,
+      "index_rss_kib": 52864
+    },
+    "1m": {
+      "fsearch_median_ms": 14.900500000000001,
+      "index_median_ms": 9.890808500017556,
+      "index_engine_median_ms": 9.329,
+      "fsearch_max_ms": 29.41,
+      "index_max_ms": 27.270287999954235,
+      "fsearch_cpu_median_ms": 204.82999999999998,
+      "index_cpu_median_ms": 25.5,
+      "fsearch_log": "build_ms=2451.9 build_cpu_ms=5978.0 rss_kib=143108 rss_delta_kib=134884\nfinal_rss_kib=179288\n",
+      "index_ready_ms": 378.75978199963356,
+      "index_rss_kib": 122708
+    }
+  },
+  "same_candidates": {
+    "regular": {
+      "summary": {
+        "verified_cases": 30,
+        "total_cases": 30,
+        "status": [
+          {
+            "dead": 0,
+            "entries": 315143,
+            "exclude": [
+              ".git",
+              "node_modules",
+              ".cache",
+              "__pycache__",
+              ".npm",
+              ".nvm",
+              ".cargo",
+              ".rustup",
+              ".gradle",
+              ".venv",
+              "venv",
+              ".local/share/Trash",
+              ".local/share/flatpak"
+            ],
+            "fresh": false,
+            "generation": 315144,
+            "index_bytes": 29533809,
+            "roots": [
+              "/benchmark/home"
+            ],
+            "rss_kib": 47820,
+            "v": 1,
+            "version": "0.1.1",
+            "watches": 0
+          },
+          {
+            "dead": 0,
+            "entries": 315143,
+            "exclude": [
+              ".git",
+              "node_modules",
+              ".cache",
+              "__pycache__",
+              ".npm",
+              ".nvm",
+              ".cargo",
+              ".rustup",
+              ".gradle",
+              ".venv",
+              "venv",
+              ".local/share/Trash",
+              ".local/share/flatpak"
+            ],
+            "fresh": false,
+            "generation": 315144,
+            "index_bytes": 29533809,
+            "roots": [
+              "/benchmark/home"
+            ],
+            "rss_kib": 49280,
+            "v": 1,
+            "version": "0.1.1",
+            "watches": 0
+          }
+        ],
+        "fsearch": {
+          "wall_ms": 9.8325,
+          "cpu_ms": 148.72500000000002
+        },
+        "baseline": {
+          "wall_ms": 5.5109215,
+          "cpu_ms": 14.666666666666668
+        },
+        "candidate": {
+          "wall_ms": 4.052474,
+          "cpu_ms": 8.916666666666666
+        }
+      },
+      "faster_cases": 26,
+      "by_kind": {
+        "a": {
+          "fsearch": {
+            "wall_ms": 11.2945,
+            "cpu_ms": 178.215
+          },
+          "candidate": {
+            "wall_ms": 5.7929312500000005,
+            "cpu_ms": 12.0
+          }
+        },
+        "d": {
+          "fsearch": {
+            "wall_ms": 2.7562499999999996,
+            "cpu_ms": 30.9725
+          },
+          "candidate": {
+            "wall_ms": 2.80758675,
+            "cpu_ms": 6.583333333333334
+          }
+        },
+        "f": {
+          "fsearch": {
+            "wall_ms": 10.8285,
+            "cpu_ms": 165.7525
+          },
+          "candidate": {
+            "wall_ms": 4.23340325,
+            "cpu_ms": 9.833333333333334
+          }
+        }
+      },
+      "fsearch_timing_log": "build_ms=616.6 build_cpu_ms=1427.9 rss_kib=50004 rss_delta_kib=41752\nfinal_rss_kib=67360\n"
+    },
+    "1m": {
+      "summary": {
+        "verified_cases": 30,
+        "total_cases": 30,
+        "status": [
+          {
+            "dead": 0,
+            "entries": 964036,
+            "exclude": [
+              ".git",
+              "node_modules",
+              ".cache",
+              "__pycache__",
+              ".npm",
+              ".nvm",
+              ".cargo",
+              ".rustup",
+              ".gradle",
+              ".venv",
+              "venv",
+              ".local/share/Trash",
+              ".local/share/flatpak"
+            ],
+            "fresh": false,
+            "generation": 964037,
+            "index_bytes": 78685483,
+            "roots": [
+              "/benchmark/synthetic-1m"
+            ],
+            "rss_kib": 126728,
+            "v": 1,
+            "version": "0.1.1",
+            "watches": 0
+          },
+          {
+            "dead": 0,
+            "entries": 964036,
+            "exclude": [
+              ".git",
+              "node_modules",
+              ".cache",
+              "__pycache__",
+              ".npm",
+              ".nvm",
+              ".cargo",
+              ".rustup",
+              ".gradle",
+              ".venv",
+              "venv",
+              ".local/share/Trash",
+              ".local/share/flatpak"
+            ],
+            "fresh": false,
+            "generation": 964037,
+            "index_bytes": 78685483,
+            "roots": [
+              "/benchmark/synthetic-1m"
+            ],
+            "rss_kib": 125620,
+            "v": 1,
+            "version": "0.1.1",
+            "watches": 0
+          }
+        ],
+        "fsearch": {
+          "wall_ms": 27.28725,
+          "cpu_ms": 491.6175
+        },
+        "baseline": {
+          "wall_ms": 13.561220500000001,
+          "cpu_ms": 42.75
+        },
+        "candidate": {
+          "wall_ms": 12.333059,
+          "cpu_ms": 28.25
+        }
+      },
+      "faster_cases": 26,
+      "by_kind": {
+        "a": {
+          "fsearch": {
+            "wall_ms": 28.8335,
+            "cpu_ms": 524.7475000000001
+          },
+          "candidate": {
+            "wall_ms": 19.43003125,
+            "cpu_ms": 47.16666666666667
+          }
+        },
+        "d": {
+          "fsearch": {
+            "wall_ms": 9.38325,
+            "cpu_ms": 113.035
+          },
+          "candidate": {
+            "wall_ms": 8.50651975,
+            "cpu_ms": 20.416666666666664
+          }
+        },
+        "f": {
+          "fsearch": {
+            "wall_ms": 28.55475,
+            "cpu_ms": 510.83000000000004
+          },
+          "candidate": {
+            "wall_ms": 13.06351375,
+            "cpu_ms": 33.25
+          }
+        }
+      },
+      "fsearch_timing_log": "build_ms=2554.6 build_cpu_ms=5949.8 rss_kib=143204 rss_delta_kib=134924\nfinal_rss_kib=181100\n"
+    }
+  },
+  "baseline_commit": "bbd853e",
+  "candidate_commit": "188dcff"
+}

@@ -1,0 +1,36 @@
+{
+  "date": "2026-10-14",
+  "baseline_commit": "bbd853e",
+  "candidate_commit": "188dcff",
+  "cpu": "Intel Core i7-14700HX",
+  "logical_cpus": 28,
+  "filesystem": "btrfs",
+  "cache": "warm",
+  "default_threads": {
+    "lince": 8,
+    "fsearch": 28
+  },
+  "files": {
+    "paired-100k.json.gz": {
+      "sha256": "45b35ee1d66655ed7e72dfcfc91b697daeebf79c63cfa24f007d9816b3e5d8ae"
+    },
+    "paired-home.json.gz": {
+      "sha256": "69181233004d07efe0dc26f04a1530fb1b2141949ae6cfc9aa25626527c73d24"
+    },
+    "paired-1m.json.gz": {
+      "sha256": "7426f73078e7025c8977c0b485528ae6ddce64a7552851d5f345957f8ae30997"
+    },
+    "operational-home.json.gz": {
+      "sha256": "ef25a27de0aaeacb8c3648556eada6f3eaaec4d7c9f1c4518112da76fc405ed0"
+    },
+    "operational-1m.json.gz": {
+      "sha256": "800c9a5b69e780c663fcf193e0f2fad5ce262477335693a0ee187812833a782b"
+    },
+    "paths-home.json.gz": {
+      "sha256": "2886df6fed8b8f78803179007b1f442a4152e677ac6208fea9c7fa16ff874806"
+    },
+    "paths-1m.json.gz": {
+      "sha256": "03e2efddd29c9baaeda0a994dd33e0b19fcfa66902e72bce730ba0d20d12aaf3"
+    }
+  }
+}
