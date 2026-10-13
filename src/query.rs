@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use memchr::memmem::Finder;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::fold::{fold, is_subsequence};
@@ -182,8 +183,28 @@ fn ranges(n: usize, parts: usize) -> Vec<(usize, usize)> {
 }
 
 fn workers(n: usize) -> usize {
-    // Thread start-up costs ~20 µs; below this size one thread wins.
+    // Keep small scans on the caller rather than dispatching tiny jobs.
     if n < 50_000 { 1 } else { crate::threads() }
+}
+
+/// Reuse workers across query phases and requests. Small jobs stay on the
+/// caller; indexed collection preserves chunk order (`select: first`). If
+/// worker creation fails, searches can still run on the caller.
+fn map_parts<T: Sync, R: Send>(parts: &[T], f: impl Fn(&T) -> R + Sync + Send) -> Vec<R> {
+    if parts.len() <= 1 {
+        return parts.iter().map(f).collect();
+    }
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    match POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(crate::threads().max(1))
+            .thread_name(|i| format!("lince-query-{i}"))
+            .build()
+            .ok()
+    }) {
+        Some(pool) => pool.install(|| parts.par_iter().map(f).collect()),
+        None => parts.iter().map(f).collect(),
+    }
 }
 
 /// Entries whose folded name contains the term, found by scanning the whole
@@ -199,29 +220,22 @@ fn name_hits(index: &Index, term: &Term) -> Bits {
     cuts[0] = 0;
     cuts.push(blob.len());
     cuts.dedup();
-    let found: Vec<Vec<u32>> = std::thread::scope(|s| {
-        let handles: Vec<_> = cuts
-            .windows(2)
-            .map(|w| {
-                let (start, end) = (w[0], w[1]);
-                s.spawn(move || {
-                    let mut ids = Vec::new();
-                    let mut pos = start;
-                    while let Some(i) = term.finder.find(&blob[pos..end]) {
-                        let hit = pos + i;
-                        if let Some(id) = index.owner_at(hit) {
-                            ids.push(id);
-                        }
-                        pos = hit + memchr::memchr(0, &blob[hit..end]).unwrap_or(end - hit) + 1;
-                        if pos >= end {
-                            break;
-                        }
-                    }
-                    ids
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    let parts: Vec<_> = cuts.windows(2).map(|w| (w[0], w[1])).collect();
+    let found: Vec<Vec<u32>> = map_parts(&parts, |&(start, end)| {
+        let mut ids = Vec::new();
+        let mut pos = start;
+        let mut owner = 0;
+        while let Some(i) = term.finder.find(&blob[pos..end]) {
+            let hit = pos + i;
+            if let Some(id) = index.owner_at(hit, &mut owner) {
+                ids.push(id);
+            }
+            pos = hit + memchr::memchr(0, &blob[hit..end]).unwrap_or(end - hit) + 1;
+            if pos >= end {
+                break;
+            }
+        }
+        ids
     });
     let mut bits = Bits::new(index.entries.len());
     for id in found.into_iter().flatten() {
@@ -469,11 +483,7 @@ impl<'a> Scan<'a> {
         let n = self.index.entries.len();
         let parts = ranges(n, workers(n));
         let this = &*self;
-        let chunks: Vec<(Vec<u32>, Vec<u32>)> = std::thread::scope(|s| {
-            let handles: Vec<_> =
-                parts.iter().map(|&(a, b)| s.spawn(move || this.scan_range(kind, a, b))).collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
+        let chunks = map_parts(&parts, |&(a, b)| this.scan_range(kind, a, b));
         let (mut basename, mut path) = (Vec::new(), Vec::new());
         for (b, p) in chunks {
             basename.extend(b);
@@ -488,11 +498,7 @@ impl<'a> Scan<'a> {
         if self.q.fuzzy_ok && found.len() < max.min(60) {
             let already: std::collections::HashSet<u32> = found.iter().copied().collect();
             let this = &*self;
-            let fuzzy: Vec<Vec<u32>> = std::thread::scope(|s| {
-                let handles: Vec<_> =
-                    parts.iter().map(|&(a, b)| s.spawn(move || this.fuzzy_range(kind, a, b))).collect();
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
-            });
+            let fuzzy = map_parts(&parts, |&(a, b)| this.fuzzy_range(kind, a, b));
             for id in fuzzy.into_iter().flatten() {
                 if !already.contains(&id) && !self.excluded(id) {
                     found.push(id);
@@ -528,39 +534,32 @@ impl<'a> Scan<'a> {
         // the name, otherwise a lower bound (a term found only in the path
         // scores at least 4, the best path score).
         let this = &*self;
-        let parts: Vec<Vec<(u64, u32, bool)>> = std::thread::scope(|s| {
-            let handles: Vec<_> = found
-                .chunks(found.len().div_ceil(workers(found.len() * 8)).max(1))
-                .map(|chunk| {
-                    s.spawn(move || {
-                        chunk
-                            .iter()
-                            .map(|&id| {
-                                let e = &index.entries[id as usize];
-                                let len = utf16_len(index.name(id));
-                                if browse {
-                                    // Browsing orders by name, not length: leave
-                                    // names to the tie-break below.
-                                    return (pack(e.depth as u32, e.flags & HIDDEN, 0), id, true);
-                                }
-                                let name = index.folded(id);
-                                let mut exact = true;
-                                let score = this.q.score_terms.iter().fold(0u32, |total, t| {
-                                    let s = score_term(name, t);
-                                    if s < 0 {
-                                        exact = false;
-                                        total + 4
-                                    } else {
-                                        total + s as u32
-                                    }
-                                });
-                                (pack(score, e.flags & HIDDEN, len), id, exact)
-                            })
-                            .collect()
-                    })
+        let chunks: Vec<_> = found.chunks(found.len().div_ceil(workers(found.len() * 8)).max(1)).collect();
+        let parts: Vec<Vec<(u64, u32, bool)>> = map_parts(&chunks, |chunk| {
+            chunk
+                .iter()
+                .map(|&id| {
+                    let e = &index.entries[id as usize];
+                    let len = utf16_len(index.name(id));
+                    if browse {
+                        // Browsing orders by name, not length: leave
+                        // names to the tie-break below.
+                        return (pack(e.depth as u32, e.flags & HIDDEN, 0), id, true);
+                    }
+                    let name = index.folded(id);
+                    let mut exact = true;
+                    let score = this.q.score_terms.iter().fold(0u32, |total, t| {
+                        let s = score_term(name, t);
+                        if s < 0 {
+                            exact = false;
+                            total + 4
+                        } else {
+                            total + s as u32
+                        }
+                    });
+                    (pack(score, e.flags & HIDDEN, len), id, exact)
                 })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
+                .collect()
         });
         let mut keyed: Vec<(u64, u32, bool)> = parts.into_iter().flatten().collect();
         // Refine bounds that could still make the cut until the cut is made
@@ -598,19 +597,29 @@ impl<'a> Scan<'a> {
         let mut keep: Vec<u32> = keyed.iter().filter(|k| k.0 < boundary).map(|k| k.1).collect();
         // Entries tied with the boundary are decided by the protocol's last
         // keys: by path for queries, by folded name and then path when
-        // browsing. The kept set never depends on crawl order.
+        // browsing. Partition only the needed prefix instead of sorting every
+        // tie: returned ids are ordered below, independently of rank.
         let mut tied: Vec<u32> = keyed.iter().filter(|k| k.0 == boundary).map(|k| k.1).collect();
         let utf16_path = |id: u32| -> Vec<u16> { index.path(id).to_string_lossy().encode_utf16().collect() };
+        let needed = max - keep.len();
         if browse {
-            tied.sort_unstable_by(|&a, &b| {
+            let compare = |a: &u32, b: &u32| {
+                let (a, b) = (*a, *b);
                 index.folded(a).cmp(index.folded(b)).then_with(|| utf16_path(a).cmp(&utf16_path(b)))
-            });
+            };
+            if tied.len() > needed {
+                tied.select_nth_unstable_by(needed, compare);
+                tied.truncate(needed);
+            }
         } else {
             let mut paths: Vec<(Vec<u16>, u32)> = tied.iter().map(|&id| (utf16_path(id), id)).collect();
-            paths.sort_unstable();
+            if paths.len() > needed {
+                paths.select_nth_unstable(needed);
+                paths.truncate(needed);
+            }
             tied = paths.into_iter().map(|p| p.1).collect();
         }
-        keep.extend(tied.into_iter().take(max - keep.len()));
+        keep.extend(tied);
         keep.sort_unstable();
         *found = keep;
     }
@@ -771,6 +780,46 @@ mod tests {
         // but shorter in UTF-16 code units (9 vs 10).
         let index = files(&dir, &["report-ññ".as_bytes(), b"report-abc"]);
         assert_eq!(kept(&index, "report", 1), ["report-ññ"]);
+    }
+
+    #[test]
+    fn boundary_ties_match_a_full_sort() {
+        let dir = tempdir::Dir::new();
+        let names: Vec<String> = (0..512)
+            .map(|i| {
+                // U+10000 sorts before U+E000 in UTF-16, after it in UTF-8.
+                let prefix = if i % 2 == 0 { "\u{10000}" } else { "\u{e000}" };
+                let hidden = if i % 3 == 0 { "." } else { "" };
+                let nested = if i % 5 == 0 { "nested/" } else { "" };
+                format!("{hidden}{prefix}{i:04}/{nested}report")
+            })
+            .collect();
+        let refs: Vec<_> = names.iter().map(|s| s.as_bytes()).collect();
+        let index = files(&dir, &refs);
+        for query in ["report", ""] {
+            let mut all: Vec<_> = index.entries.iter().enumerate()
+                .filter(|(_, e)| e.kind == Kind::File)
+                .map(|(id, _)| id as u32)
+                .collect();
+            // Independent full-sort oracle. All names are identical, so name
+            // score/length and browse name keys tie; hidden/depth/path decide.
+            all.sort_by_key(|&id| {
+                let e = &index.entries[id as usize];
+                (e.flags & HIDDEN, if query.is_empty() { e.depth } else { 0 },
+                 index.path(id).to_str().unwrap().encode_utf16().collect::<Vec<_>>())
+            });
+            for max in [1, 2, 60, 200, 511] {
+                let req: Request = serde_json::from_value(serde_json::json!({
+                    "query": query, "kinds": ["f"], "hidden": true, "max_results": max
+                })).unwrap();
+                let mut got = search(&index, &req).unwrap().files;
+                let mut want: Vec<_> = all[..max].iter()
+                    .map(|&id| index.path(id).to_str().unwrap().to_owned()).collect();
+                got.sort();
+                want.sort();
+                assert_eq!(got, want, "query {query:?}, cap {max}");
+            }
+        }
     }
 
     #[test]

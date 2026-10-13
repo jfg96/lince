@@ -199,10 +199,22 @@ impl Index {
         &self.folded
     }
 
-    /// Entry owning the folded name that contains blob offset `off`, if that
-    /// name is still current.
-    pub fn owner_at(&self, off: usize) -> Option<u32> {
-        let i = self.owner_off.partition_point(|&o| o as usize <= off).checked_sub(1)?;
+    /// Entry owning a blob hit, if the name is still current. A scan's cursor
+    /// remembers its last owner. Exponential search brackets the next hit in
+    /// O(log gap) rather than searching the entire owner table for every hit.
+    pub fn owner_at(&self, off: usize, cursor: &mut usize) -> Option<u32> {
+        let offsets = &self.owner_off;
+        let mut start = (*cursor).min(offsets.len());
+        if start == offsets.len() || offsets[start] as usize > off {
+            start = 0;
+        }
+        let mut step = 1;
+        while start + step < offsets.len() && offsets[start + step] as usize <= off {
+            step *= 2;
+        }
+        let end = (start + step + 1).min(offsets.len());
+        let i = start + offsets[start..end].partition_point(|&o| o as usize <= off).checked_sub(1)?;
+        *cursor = i;
         let id = self.owner_id[i];
         let e = &self.entries[id as usize];
         (e.fold_off == self.owner_off[i] && e.kind != Kind::Dead).then_some(id)
@@ -739,6 +751,31 @@ pub(crate) mod tests {
         assert_eq!(idx.path(map[file as usize]), before);
         assert_eq!(idx.dead, 0);
         assert!(find(&idx, "Música").is_none());
+    }
+
+    #[test]
+    fn blob_owner_cursor_handles_gaps_and_stale_names() {
+        let (_dir, mut idx) = fixture();
+        let file = find(&idx, "a/b/file.txt").unwrap();
+        idx.rename(file, idx.entries[file as usize].parent, b"renamed.txt");
+        idx.remove(find(&idx, "Música").unwrap());
+        fn check(idx: &Index) {
+            let mut cursor = 0;
+            // Compare every offset (including terminators) with an independent
+            // linear lookup; then exercise jumps and backwards/restarted scans.
+            let offsets: Vec<usize> = (0..idx.folded_blob().len()).collect();
+            for off in offsets.iter().copied().chain(offsets.iter().rev().step_by(7).copied()) {
+                let want = idx.owner_off.iter().rposition(|&o| o as usize <= off).and_then(|i| {
+                    let id = idx.owner_id[i];
+                    let e = &idx.entries[id as usize];
+                    (e.fold_off == idx.owner_off[i] && e.kind != Kind::Dead).then_some(id)
+                });
+                assert_eq!(idx.owner_at(off, &mut cursor), want, "offset {off}");
+            }
+        }
+        check(&idx);
+        idx.compact();
+        check(&idx);
     }
 }
 
