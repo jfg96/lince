@@ -11,7 +11,6 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
@@ -26,6 +25,12 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Requests are a few hundred bytes; a client sending this much without a
 /// newline is not speaking the protocol.
 const MAX_PENDING: usize = 1 << 20;
+/// Directories without a watch are retried and polled in round-robin passes
+/// of at most POLL_CHUNK, so a pass stalls queries for tens of milliseconds,
+/// not seconds. Passes are spaced to cover them all every RETRY_MIN, and
+/// never closer than 50 times a pass's duration (about 2% of one core).
+const RETRY_MIN: Duration = Duration::from_secs(10);
+const POLL_CHUNK: usize = 16_384;
 
 struct Client {
     stream: UnixStream,
@@ -125,7 +130,6 @@ fn status_json(index: &Index, watcher: &Option<Watcher>) -> String {
         .ok()
         .and_then(|s| s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)?.parse().ok()))
         .unwrap_or(0);
-    let degraded = watcher.as_ref().is_none_or(|w| w.degraded.load(Ordering::Relaxed));
     serde_json::json!({
         "v": query::PROTOCOL,
         "version": env!("CARGO_PKG_VERSION"),
@@ -136,7 +140,10 @@ fn status_json(index: &Index, watcher: &Option<Watcher>) -> String {
         "index_bytes": index.memory_bytes(),
         "rss_kib": rss,
         "watches": watcher.as_ref().map_or(0, |w| w.watch_count()),
-        "fresh": !degraded,
+        "max_watches": watcher.as_ref().map_or(0, |w| w.budget),
+        "unwatched": watcher.as_ref().map_or(0, |w| w.unwatched_count()),
+        "poll_ms": watcher.as_ref().map_or(0, |w| w.poll_ms),
+        "fresh": watcher.as_ref().is_some_and(|w| w.fresh()),
         "generation": index.generation,
     })
     .to_string()
@@ -154,8 +161,11 @@ pub fn serve(cfg: Config) -> Result<(), String> {
     }
     log(&cfg.describe());
     let sfd = signal_fd();
-    let mut watcher = if cfg.watch { Some(Watcher::new()?) } else { None };
+    let mut watcher = if cfg.watch { Some(Watcher::new(cfg.max_watches)?) } else { None };
     let mut index = open_index(&cfg, &mut watcher)?;
+    let mut next_retry = Instant::now() + RETRY_MIN;
+    let mut was_fresh = true;
+    report_watches(&watcher, &mut was_fresh);
     // Bind only once the index can answer: until then clients cannot
     // connect and keep using fd, instead of waiting on a building index.
     let listener = bind(&cfg.socket)?;
@@ -184,7 +194,11 @@ pub fn serve(cfg: Config) -> Result<(), String> {
         fds.extend(clients.iter().map(|c| libc::pollfd { fd: c.stream.as_raw_fd(), events: libc::POLLIN, revents: 0 }));
         // After a burst of queries, wait a few seconds and hand freed query
         // buffers back to the system instead of keeping the peak resident.
-        let timeout = if dirty_heap { 5_000 } else { 60_000 };
+        let mut timeout = if dirty_heap { 5_000 } else { 60_000 };
+        let polling = watcher.as_ref().is_some_and(|w| !w.fresh());
+        if polling {
+            timeout = timeout.min(next_retry.saturating_duration_since(Instant::now()).as_millis() as i32);
+        }
         let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) };
         if rc == 0 && dirty_heap {
             #[cfg(target_env = "gnu")]
@@ -268,6 +282,18 @@ pub fn serve(cfg: Config) -> Result<(), String> {
             clients.remove(i);
         }
 
+        if polling && Instant::now() >= next_retry {
+            if let Some(w) = watcher.as_mut() {
+                let pending = w.unwatched_count().max(1);
+                let t = Instant::now();
+                let checked = w.retry(&mut index, threads(), POLL_CHUNK);
+                w.poll_ms = t.elapsed().as_millis() as u64;
+                let share = RETRY_MIN.mul_f64((checked.max(1) as f64 / pending as f64).min(1.0));
+                next_retry = Instant::now() + share.max(t.elapsed() * 50);
+            }
+        }
+        report_watches(&watcher, &mut was_fresh);
+
         if index.dead > 10_000 && index.dead > index.live / 4 {
             let map = index.compact();
             if let Some(w) = watcher.as_mut() {
@@ -279,6 +305,25 @@ pub fn serve(cfg: Config) -> Result<(), String> {
             saved_generation = index.generation;
             last_save = Instant::now();
         }
+    }
+}
+
+/// Logs when directories go without a watch and when they all have one again.
+fn report_watches(watcher: &Option<Watcher>, was_fresh: &mut bool) {
+    let Some(w) = watcher else { return };
+    let fresh = w.fresh();
+    if fresh != *was_fresh {
+        if fresh {
+            log("every directory is watched again");
+        } else {
+            log(&format!(
+                "{} directories without a watch (budget {}, or fs.inotify.max_user_watches is spent): polling them every {}s or more",
+                w.unwatched_count(),
+                w.budget,
+                RETRY_MIN.as_secs()
+            ));
+        }
+        *was_fresh = fresh;
     }
 }
 
@@ -312,7 +357,7 @@ fn handle_line(line: &[u8], newest: bool, index: &mut Index, watcher: &mut Optio
     }
     match query::search(index, &req) {
         Ok(mut resp) => {
-            resp.fresh = watcher.as_ref().is_some_and(|w| !w.degraded.load(Ordering::Relaxed));
+            resp.fresh = watcher.as_ref().is_some_and(|w| w.fresh());
             serde_json::to_string(&resp).unwrap()
         }
         Err(e) => format!("{{\"v\":{},\"id\":{},\"error\":{}}}", query::PROTOCOL, req.id, serde_json::to_string(&e).unwrap()),

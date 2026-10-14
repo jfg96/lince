@@ -573,6 +573,17 @@ pub fn ctime_ns(path: &Path) -> Option<i64> {
     Some(meta.ctime() * 1_000_000_000 + meta.ctime_nsec())
 }
 
+/// The stamp to record for a directory listed now with ctime `stamp`. The
+/// kernel ticks ctime coarsely, so a change in the same tick as the listing
+/// leaves it equal; a ctime this recent is recorded off by one, so the next
+/// refresh re-reads the directory instead of trusting it (git's racy index).
+pub fn settled(stamp: i64) -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(i64::MAX, |d| d.as_nanos() as i64);
+    if now.saturating_sub(stamp) < 1_000_000_000 { stamp - 1 } else { stamp }
+}
+
 /// Lists a directory: (name, kind) for directories and regular files only,
 /// like fd --type d / --type f without --follow. Uses d_type, no stat.
 pub fn list_dir(index_root_excludes: &Override, dir: &Path) -> Vec<(Vec<u8>, Kind)> {
@@ -650,7 +661,7 @@ pub fn crawl(index: &mut Index, start: Vec<(u32, PathBuf)>, threads: usize, hook
                 {
                     let mut idx = shared.lock().unwrap();
                     if let Some(stamp) = stamp {
-                        idx.dir_stamp.insert(dir, stamp);
+                        idx.dir_stamp.insert(dir, settled(stamp));
                     }
                     for (name, kind) in listing {
                         let id = idx.add_child(dir, &name, kind);

@@ -35,7 +35,7 @@ Response:
 - `dirs` and `files` are absolute paths, at most `max_results` of each, in no particular order. Sort them on the client. Paths that are not valid UTF-8 cannot be sent as JSON strings and are left out, though `matched_*` still counts them.
 - `matched_*` counts every match, including any that were cut by `max_results`.
 - `mtimes` maps a path to milliseconds since the epoch.
-- `fresh` is `false` when changes may be missing (the daemon runs without a watcher, or inotify ran out of watches). A client that needs certainty should then walk the disk itself.
+- `fresh` is `false` when changes may be missing (the daemon runs without a watcher, or some directories have no watch). Directories without a watch are polled, so their changes show up within seconds rather than at once. A client that needs certainty should then walk the disk itself.
 - Errors look like `{"v":1,"id":7,"error":"root not indexed: /mnt/x"}`.
 - If a client sends several requests before reading, only the newest is evaluated. The others get `{"v":1,"id":N,"superseded":true}`.
 
@@ -56,5 +56,8 @@ When more than `max_results` entries match, they are ranked by score (lower is b
 ```json
 {"v":1,"version":"0.1.2","roots":["/home/me"],"exclude":[".git","node_modules"],
  "entries":313860,"dead":5,"index_bytes":32594589,"rss_kib":41220,
- "watches":34413,"fresh":true,"generation":313871}
+ "watches":34413,"max_watches":471860,"unwatched":0,"poll_ms":0,
+ "fresh":true,"generation":313871}
 ```
+
+`unwatched` counts directories without a watch (over `max_watches`, or refused by the kernel); they are polled, and `poll_ms` is the duration of the last polling pass.

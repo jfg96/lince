@@ -7,17 +7,22 @@
 //! read is lost) and a queue overflow falls back to the ctime validation in
 //! persist::refresh.
 //!
+//! Watches are a per-user kernel budget (fs.inotify.max_user_watches) shared
+//! with every other program, so the watcher stops short of it. Directories it
+//! cannot watch are not given up on: they are polled by ctime and watched as
+//! soon as there is room again.
+//!
 //! Handlers are idempotent: an event describing something the index already
 //! reflects is a no-op, so events and rescans can overlap safely.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CString, OsStr};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use crate::index::{crawl, DirHook, Index, Kind};
+use crate::persist;
 
 const MASK: u32 = libc::IN_CREATE
     | libc::IN_DELETE
@@ -32,10 +37,18 @@ pub struct Watcher {
     wd_dir: HashMap<i32, u32>,
     dir_wd: HashMap<u32, i32>,
     added: Mutex<Vec<(i32, u32)>>,
-    /// Set when inotify refused a watch (usually max_user_watches): the index
-    /// can no longer promise freshness and clients should know. It stays set:
-    /// the directories that were refused are not retried.
-    pub degraded: AtomicBool,
+    /// Directories refused a watch by crawl workers, until `commit`.
+    refused: Mutex<Vec<u32>>,
+    /// Directories without a watch (over the budget, or inotify said ENOSPC).
+    /// Changes in them are only seen by `retry`, so the index cannot promise
+    /// freshness until this is empty again.
+    unwatched: HashSet<u32>,
+    /// `unwatched` in retry order; may hold ids since dropped from the set.
+    retry_queue: VecDeque<u32>,
+    /// Most watches this daemon takes.
+    pub budget: usize,
+    /// Duration of the last `retry` pass, for status.
+    pub poll_ms: u64,
 }
 
 #[derive(Default, Debug)]
@@ -47,19 +60,28 @@ pub struct Applied {
 impl DirHook for Watcher {
     fn before_read(&self, id: u32, path: &Path) {
         let Ok(c) = CString::new(path.as_os_str().as_bytes()) else { return };
+        let mut added = self.added.lock().unwrap();
+        if self.wd_dir.len() + added.len() >= self.budget {
+            drop(added);
+            self.refused.lock().unwrap().push(id);
+            return;
+        }
         let wd = unsafe { libc::inotify_add_watch(self.fd, c.as_ptr(), MASK) };
         if wd < 0 {
             if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOSPC) {
-                self.degraded.store(true, Ordering::Relaxed);
+                drop(added);
+                self.refused.lock().unwrap().push(id);
             }
             return;
         }
-        self.added.lock().unwrap().push((wd, id));
+        added.push((wd, id));
     }
 }
 
 impl Watcher {
-    pub fn new() -> Result<Watcher, String> {
+    /// `budget` defaults to 90% of fs.inotify.max_user_watches, leaving the
+    /// rest to editors, file managers and the desktop.
+    pub fn new(budget: Option<usize>) -> Result<Watcher, String> {
         let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
         if fd < 0 {
             return Err(format!("inotify_init1: {}", std::io::Error::last_os_error()));
@@ -69,12 +91,50 @@ impl Watcher {
             wd_dir: HashMap::new(),
             dir_wd: HashMap::new(),
             added: Mutex::new(Vec::new()),
-            degraded: AtomicBool::new(false),
+            refused: Mutex::new(Vec::new()),
+            unwatched: HashSet::new(),
+            retry_queue: VecDeque::new(),
+            budget: budget.unwrap_or_else(default_budget),
+            poll_ms: 0,
         })
     }
 
     pub fn watch_count(&self) -> usize {
         self.wd_dir.len()
+    }
+
+    pub fn unwatched_count(&self) -> usize {
+        self.unwatched.len() + self.refused.lock().unwrap().len()
+    }
+
+    /// Every directory has a watch, so events reflect every change.
+    pub fn fresh(&self) -> bool {
+        self.unwatched_count() == 0
+    }
+
+    /// Tries again to watch up to `max` directories without a watch, in
+    /// round-robin order, then re-reads those of them whose ctime changed:
+    /// changes made while unwatched are caught either way, and the ones still
+    /// unwatched are polled this way. Returns how many were checked.
+    pub fn retry(&mut self, index: &mut Index, threads: usize, max: usize) -> usize {
+        self.commit();
+        let mut dirs = Vec::new();
+        while dirs.len() < max {
+            let Some(d) = self.retry_queue.pop_front() else { break };
+            if self.unwatched.remove(&d) && index.is_dir(d) {
+                dirs.push(d);
+            }
+        }
+        // Parents first: re-reading one may remove or add its descendants.
+        dirs.sort_unstable_by_key(|&d| (index.entries[d as usize].depth, d));
+        for &d in &dirs {
+            // Watch before the ctime check, so no change falls in between.
+            self.before_read(d, &index.path(d));
+        }
+        self.commit();
+        persist::refresh_dirs(index, &dirs, threads, self);
+        self.commit();
+        dirs.len()
     }
 
     /// Moves watches registered by crawl workers into the lookup tables.
@@ -86,6 +146,11 @@ impl Watcher {
                 }
             }
             self.dir_wd.insert(id, wd);
+        }
+        for id in self.refused.get_mut().unwrap().drain(..) {
+            if self.unwatched.insert(id) {
+                self.retry_queue.push_back(id);
+            }
         }
     }
 
@@ -107,10 +172,14 @@ impl Watcher {
                 self.dir_wd.insert(new, wd);
             }
         }
+        let remap = |id: u32| Some(map[id as usize]).filter(|&id| id != crate::index::NONE);
+        self.unwatched = self.unwatched.iter().filter_map(|&id| remap(id)).collect();
+        self.retry_queue = self.retry_queue.iter().filter_map(|&id| remap(id)).filter(|id| self.unwatched.contains(id)).collect();
     }
 
     fn forget(&mut self, dirs: &[u32]) {
         for d in dirs {
+            self.unwatched.remove(d);
             if let Some(wd) = self.dir_wd.remove(d) {
                 self.wd_dir.remove(&wd);
                 // A directory moved out of the tree keeps its watch alive.
@@ -258,6 +327,14 @@ impl Watcher {
     }
 }
 
+fn default_budget() -> usize {
+    let limit = std::fs::read_to_string("/proc/sys/fs/inotify/max_user_watches")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(8192);
+    limit - limit / 10
+}
+
 impl Drop for Watcher {
     fn drop(&mut self) {
         unsafe { libc::close(self.fd) };
@@ -280,7 +357,7 @@ mod tests {
         std::fs::create_dir_all(dir.0.join("a/sub")).unwrap();
         std::fs::write(dir.0.join("a/sub/old.txt"), b"").unwrap();
         std::fs::write(dir.0.join("gone.txt"), b"").unwrap();
-        let mut w = Watcher::new().unwrap();
+        let mut w = Watcher::new(None).unwrap();
         let mut index = build(&[dir.0.clone()], &[], 2, &w).unwrap();
         w.commit();
 
@@ -303,14 +380,76 @@ mod tests {
         std::fs::write(dir.0.join("z/sub/later.txt"), b"").unwrap();
         w.drain(&mut index, 2);
         assert!(lookup(&index, "z/sub/later.txt").is_some());
-        assert!(!w.degraded.load(Ordering::Relaxed));
+        assert!(w.fresh());
+    }
+
+    #[test]
+    fn polls_and_recovers_directories_over_the_budget() {
+        let dir = tempdir::Dir::new();
+        for d in ["a", "b", "c/d"] {
+            std::fs::create_dir_all(dir.0.join(d)).unwrap();
+        }
+        // Room for the root and one more: the other directories go unwatched.
+        let mut w = Watcher::new(Some(2)).unwrap();
+        let mut index = build(&[dir.0.clone()], &[], 1, &w).unwrap();
+        w.commit();
+        assert_eq!(w.watch_count(), 2);
+        assert_eq!(w.unwatched_count(), 3);
+        assert!(!w.fresh());
+
+        // No events from unwatched directories: polling has to find these.
+        for d in ["a", "b", "c/d"] {
+            std::fs::write(dir.0.join(d).join("new.txt"), b"").unwrap();
+        }
+        std::fs::create_dir(dir.0.join("c/d/sub")).unwrap();
+        std::fs::write(dir.0.join("c/d/sub/deep.txt"), b"").unwrap();
+        w.drain(&mut index, 1);
+        w.retry(&mut index, 1, usize::MAX);
+        for rel in ["a/new.txt", "b/new.txt", "c/d/new.txt", "c/d/sub/deep.txt"] {
+            assert!(lookup(&index, rel).is_some(), "{rel} found by polling");
+        }
+        assert!(!w.fresh());
+
+        // Same-tick changes are not lost to coarse ctimes: every poll keeps
+        // finding what changed since the previous one.
+        for i in 0..20 {
+            std::fs::write(dir.0.join(format!("b/quick{i}.txt")), b"").unwrap();
+            w.retry(&mut index, 1, usize::MAX);
+            assert!(lookup(&index, &format!("b/quick{i}.txt")).is_some(), "quick{i}");
+        }
+        // One directory per pass: still unwatched ones go to the back, so
+        // passes take turns instead of retrying the same one forever.
+        for d in ["a", "b", "c/d"] {
+            std::fs::write(dir.0.join(d).join("turns.txt"), b"").unwrap();
+        }
+        w.drain(&mut index, 1);
+        for _ in 0..w.unwatched_count() {
+            w.retry(&mut index, 1, 1);
+        }
+        for d in ["a", "b", "c/d"] {
+            assert!(lookup(&index, &format!("{d}/turns.txt")).is_some(), "{d} polled in turn");
+        }
+        std::fs::remove_dir_all(dir.0.join("c/d")).unwrap();
+        w.drain(&mut index, 1);
+        w.retry(&mut index, 1, usize::MAX);
+        assert!(lookup(&index, "c/d").is_none());
+
+        // Room again: everything gets watched and events take over.
+        w.budget = 100;
+        w.retry(&mut index, 1, usize::MAX);
+        assert!(w.fresh(), "{} still unwatched", w.unwatched_count());
+        std::fs::write(dir.0.join("a/later.txt"), b"").unwrap();
+        std::fs::create_dir(dir.0.join("b/fresh")).unwrap();
+        w.drain(&mut index, 1);
+        assert!(lookup(&index, "a/later.txt").is_some());
+        assert!(lookup(&index, "b/fresh").is_some());
     }
 
     #[test]
     fn keeps_entries_created_just_before_a_parent_rename() {
         let dir = tempdir::Dir::new();
         std::fs::create_dir_all(dir.0.join("a")).unwrap();
-        let mut w = Watcher::new().unwrap();
+        let mut w = Watcher::new(None).unwrap();
         let mut index = build(&[dir.0.clone()], &[], 2, &w).unwrap();
         w.commit();
 
