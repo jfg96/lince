@@ -23,8 +23,8 @@ Used by [Omarchy Find](https://github.com/jfg96/omarchy-find), which fetches a p
 The [releases](https://github.com/jfg96/lince/releases) page has a prebuilt x86-64 binary with its SHA-256:
 
 ```sh
-tar xzf lince-v0.1.2-x86_64-linux.tar.gz
-install -Dm755 lince-v0.1.2-x86_64-linux/lince ~/.local/bin/lince
+tar xzf lince-v0.1.3-x86_64-linux.tar.gz
+install -Dm755 lince-v0.1.3-x86_64-linux/lince ~/.local/bin/lince
 ```
 
 Or build it from source (Rust 1.85+):
