@@ -39,6 +39,12 @@ pub fn fold(text: &str) -> Vec<u8> {
 /// multi-byte character); others compare whole characters.
 pub fn is_subsequence(needle: &[u8], hay: &[u8]) -> bool {
     if needle.is_ascii() {
+        // Each ASCII character needs at least one byte in the haystack.
+        // Keep this byte bound on the ASCII path: the Unicode fallback
+        // compares lossy-decoded characters, not the original byte lengths.
+        if needle.len() > hay.len() {
+            return false;
+        }
         let mut it = hay.iter();
         return needle.iter().all(|n| it.any(|h| h == n));
     }
@@ -65,5 +71,33 @@ mod tests {
         assert!(is_subsequence(b"omfind", b"omarchy-find"));
         assert!(!is_subsequence(b"omfindx", b"omarchy-find"));
         assert!(is_subsequence(b"", b"x"));
+    }
+
+    #[test]
+    fn subsequence_matches_character_oracle() {
+        fn oracle(needle: &[u8], hay: &[u8]) -> bool {
+            let hay = String::from_utf8_lossy(hay);
+            let mut it = hay.chars();
+            String::from_utf8_lossy(needle).chars().all(|n| it.any(|h| h == n))
+        }
+        // Exhaust the small ASCII space, including repeated characters,
+        // NULs and empty strings; then exercise Unicode and invalid bytes.
+        let mut strings = vec![Vec::new()];
+        for len in 1..=5 {
+            for mut bits in 0..3usize.pow(len) {
+                let mut s = Vec::new();
+                for _ in 0..len {
+                    s.push([b'a', b'b', 0][bits % 3]);
+                    bits /= 3;
+                }
+                strings.push(s);
+            }
+        }
+        strings.extend(["é日本😀".as_bytes().to_vec(), "日本".as_bytes().to_vec(), vec![0xff], vec![0xff, b'a']]);
+        for needle in &strings {
+            for hay in &strings {
+                assert_eq!(is_subsequence(needle, hay), oracle(needle, hay), "{needle:?} in {hay:?}");
+            }
+        }
     }
 }
