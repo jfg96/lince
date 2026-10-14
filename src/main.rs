@@ -1,7 +1,7 @@
 //! lince: a resident filename index for Linux desktops.
 //!
 //!   lince serve  [--config F] [--root DIR]... [--exclude P]... [--socket S]
-//!                [--snapshot F] [--no-watch] [--exit-with-parent]
+//!                [--snapshot F] [--no-watch] [--max-watches N] [--exit-with-parent]
 //!   lince search [--socket S] [--dirs|--files] [--hidden] [--limit N] [--json] TERMS...
 //!   lince status [--socket S]
 //!   lince query  [--socket S]        raw protocol: request lines on stdin
@@ -25,7 +25,7 @@ const USAGE: &str = "usage: lince serve|search|status|query|oneshot|stats [optio
 /// Flags that take a value; everything else is a switch or a positional.
 const VALUED: &[&str] = &[
     "--config", "--root", "--exclude", "--socket", "--snapshot", "--limit", "--query", "--kind",
-    "--max-results", "--extensions", "--scope", "--max-depth", "--select",
+    "--max-results", "--max-watches", "--extensions", "--scope", "--max-depth", "--select",
 ];
 
 struct Args(Vec<String>);
@@ -95,6 +95,10 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
         socket: args.value("--socket"),
         snapshot: args.value("--snapshot"),
         no_watch: args.flag("--no-watch"),
+        max_watches: match args.value("--max-watches") {
+            Some(v) => Some(v.parse().map_err(|_| format!("--max-watches: not a number: {v}"))?),
+            None => None,
+        },
         exit_with_parent: args.flag("--exit-with-parent"),
     })?;
     server::serve(cfg)

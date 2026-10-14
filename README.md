@@ -53,15 +53,18 @@ A second `lince serve` on the same socket exits immediately, so clients can alwa
 
 ### Configuration
 
-`~/.config/lince/config.json` is optional. Command-line flags (`--root`, `--exclude`, `--socket`, `--snapshot`, `--no-watch`) override it.
+`~/.config/lince/config.json` is optional. Command-line flags (`--root`, `--exclude`, `--socket`, `--snapshot`, `--no-watch`, `--max-watches`) override it.
 
 ```json
 {
   "roots": ["~", "/mnt/data"],
   "exclude": [".git", "node_modules", ".cache", "__pycache__", ".venv", "venv", ".local/share/Trash"],
-  "watch": true
+  "watch": true,
+  "max_watches": 100000
 }
 ```
+
+`max_watches` caps the inotify watches lince takes; by default 90% of `fs.inotify.max_user_watches`, so editors and the desktop keep some.
 
 By default lince indexes `~` and excludes version-control folders, package caches, virtual environments and the trash. A root inside another root is ignored. Snapshots go to `~/.cache/lince/`, one per configuration.
 
@@ -109,7 +112,7 @@ These operational cases use each engine's matching behavior and can return diffe
 ## Limits
 
 - Linux only (inotify, signalfd). It indexes names, not contents or metadata.
-- Watches cost kernel memory (up to about 1 KB each) and count against `fs.inotify.max_user_watches`. A home with 34k directories uses 34k watches. If the limit is reached, responses say `"fresh": false`.
+- Watches cost kernel memory (up to about 1 KB each) and count against `fs.inotify.max_user_watches`. A home with 34k directories uses 34k watches. Directories past `max_watches`, or refused by the kernel, are polled by ctime in round-robin passes of at most 16k directories (tens of milliseconds each, about 2% of one core), every directory about every 10 seconds or more, and watched again once watches are freed. Meanwhile responses say `"fresh": false` and status reports `unwatched`.
 - A cold start right after boot has not been benchmarked yet. The snapshot plus ctime validation is there to keep it short.
 
 ## Development

@@ -19,7 +19,7 @@ use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use crate::index::{crawl, ctime_ns, list_dir, DirHook, Index, Kind};
+use crate::index::{crawl, ctime_ns, list_dir, settled, DirHook, Index, Kind};
 
 const MAGIC: &[u8; 4] = b"LNC1";
 const VERSION: u32 = 1;
@@ -193,6 +193,12 @@ pub fn refresh(index: &mut Index, threads: usize, hook: &dyn DirHook) -> usize {
         order.push(dir);
         queue.extend(index.children(dir).filter(|&c| index.is_dir(c)));
     }
+    refresh_dirs(index, &order, threads, hook)
+}
+
+/// `refresh` for just `order` (parents before their children): stats each
+/// directory and re-reads those whose ctime changed.
+pub fn refresh_dirs(index: &mut Index, order: &[u32], threads: usize, hook: &dyn DirHook) -> usize {
     let paths: Vec<PathBuf> = order.iter().map(|&d| index.path(d)).collect();
     let mut stamps = vec![None; order.len()];
     let chunk = order.len().div_ceil(threads.max(1)).max(1);
@@ -229,7 +235,7 @@ pub fn refresh(index: &mut Index, threads: usize, hook: &dyn DirHook) -> usize {
             continue;
         }
         changed += 1;
-        index.dir_stamp.insert(dir, stamp);
+        index.dir_stamp.insert(dir, settled(stamp));
         let ov = &index.roots[index.root_of(dir)].excludes;
         let listing = list_dir(ov, path);
         let present: std::collections::HashSet<(&[u8], Kind)> =

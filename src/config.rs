@@ -3,7 +3,8 @@
 //!
 //! ```json
 //! { "roots": ["~", "/mnt/data"], "exclude": [".git", "node_modules"],
-//!   "socket": "/run/user/1000/lince/lince.sock", "watch": true }
+//!   "socket": "/run/user/1000/lince/lince.sock", "watch": true,
+//!   "max_watches": 100000 }
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -36,6 +37,7 @@ struct File {
     socket: Option<String>,
     snapshot: Option<String>,
     watch: Option<bool>,
+    max_watches: Option<usize>,
 }
 
 pub struct Config {
@@ -44,6 +46,8 @@ pub struct Config {
     pub socket: PathBuf,
     pub snapshot: PathBuf,
     pub watch: bool,
+    /// None: 90% of fs.inotify.max_user_watches.
+    pub max_watches: Option<usize>,
     pub exit_with_parent: bool,
 }
 
@@ -114,6 +118,7 @@ pub struct Overrides {
     pub socket: Option<String>,
     pub snapshot: Option<String>,
     pub no_watch: bool,
+    pub max_watches: Option<usize>,
     pub exit_with_parent: bool,
 }
 
@@ -144,6 +149,7 @@ pub fn load(o: Overrides) -> Result<Config, String> {
             None => default_socket()?,
         },
         watch: !o.no_watch && file.watch.unwrap_or(true),
+        max_watches: o.max_watches.or(file.max_watches),
         exit_with_parent: o.exit_with_parent,
         roots,
         excludes,
