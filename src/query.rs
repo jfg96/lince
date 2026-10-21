@@ -16,6 +16,8 @@
 //! there are more than `max_results`, the best-ranked ones are kept.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use memchr::memmem::Finder;
@@ -23,7 +25,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::fold::{fold, is_subsequence};
-use crate::index::{build_excludes, Index, Kind, HIDDEN, VROOT};
+use crate::index::{build_excludes, IdMap, Index, Kind, HIDDEN, VROOT};
 
 /// Protocol version, reported in every response.
 pub const PROTOCOL: u32 = 1;
@@ -347,7 +349,9 @@ struct Scan<'a> {
     /// Indexed roots this request covers.
     allowed_roots: Vec<bool>,
     scope_dirs: Vec<u32>,
-    excluded_memo: HashMap<u32, bool>,
+    /// Exclusion of directories already checked; files are checked once.
+    excluded_memo: IdMap<bool>,
+    rel_buf: Vec<u8>,
 }
 
 impl<'a> Scan<'a> {
@@ -387,7 +391,7 @@ impl<'a> Scan<'a> {
             .enumerate()
             .map(|(i, e)| i != 0 && q.exts.iter().any(|x| x == e))
             .collect();
-        Ok(Scan { index, q, req, names, dirs, ext_ok, allowed_roots, scope_dirs, excluded_memo: HashMap::new() })
+        Ok(Scan { index, q, req, names, dirs, ext_ok, allowed_roots, scope_dirs, excluded_memo: IdMap::default(), rel_buf: Vec::new() })
     }
 
     /// Filters that do not depend on the query text.
@@ -436,21 +440,67 @@ impl<'a> Scan<'a> {
     /// Per-query excludes beyond the ones the index was built with: an entry
     /// is excluded when it or any ancestor matches, as fd prunes the walk.
     fn excluded(&mut self, id: u32) -> bool {
-        let Some(overrides) = &self.q.extra_excludes else { return false };
+        let q = self.q;
+        let Some(overrides) = &q.extra_excludes else { return false };
         if id == VROOT || self.index.is_root(id) {
             return false;
         }
-        let ov = &overrides[self.index.root_of(id)];
         if let Some(&v) = self.excluded_memo.get(&id) {
             return v;
         }
-        let is_dir = self.index.is_dir(id);
-        let hit = ov.matched(self.index.path(id), is_dir).is_ignore() || {
-            let parent = self.index.entries[id as usize].parent;
-            self.excluded(parent)
+        let parent = self.index.entries[id as usize].parent;
+        let hit = self.excluded(parent) || {
+            let mut buf = std::mem::take(&mut self.rel_buf);
+            let own = self.matches_exclude(overrides, id, &mut buf);
+            self.rel_buf = buf;
+            own
         };
-        self.excluded_memo.insert(id, hit);
+        if self.index.is_dir(id) {
+            self.excluded_memo.insert(id, hit);
+        }
         hit
+    }
+
+    /// Whether the per-query excludes match the entry itself, ignoring its
+    /// ancestors. The matcher strips the root from an absolute path; a path
+    /// relative to the root matches the same without building the absolute one.
+    fn matches_exclude(&self, overrides: &[ignore::overrides::Override], id: u32, buf: &mut Vec<u8>) -> bool {
+        buf.clear();
+        self.index.rel_path(id, buf);
+        let ov = &overrides[self.index.root_of(id)];
+        ov.matched(Path::new(OsStr::from_bytes(buf)), self.index.is_dir(id)).is_ignore()
+    }
+
+    /// Drops excluded candidates, keeping their order. Directories are
+    /// decided first, once each and parents before children; a file then
+    /// only needs its own name matched, which runs on the workers.
+    fn drop_excluded(&mut self, found: &mut Vec<u32>) {
+        let q = self.q;
+        let Some(overrides) = &q.extra_excludes else { return };
+        let index = self.index;
+        for &id in found.iter() {
+            self.excluded(if index.is_dir(id) { id } else { index.entries[id as usize].parent });
+        }
+        let this = &*self;
+        // A root is never excluded and is not memoised: absent means false.
+        let known = |id: u32| this.excluded_memo.get(&id).copied().unwrap_or(false);
+        let chunks: Vec<&[u32]> = found.chunks(found.len().div_ceil(workers(found.len() * 8)).max(1)).collect();
+        let kept = map_parts(&chunks, |chunk| {
+            let mut buf = Vec::new();
+            chunk
+                .iter()
+                .copied()
+                .filter(|&id| {
+                    let excluded = if index.is_dir(id) {
+                        known(id)
+                    } else {
+                        known(index.entries[id as usize].parent) || this.matches_exclude(overrides, id, &mut buf)
+                    };
+                    !excluded
+                })
+                .collect::<Vec<u32>>()
+        });
+        *found = kept.into_iter().flatten().collect();
     }
 
     fn path_match(&self, id: u32, t: usize) -> bool {
@@ -504,9 +554,7 @@ impl<'a> Scan<'a> {
         }
         let mut found = basename;
         found.extend(path);
-        if self.q.extra_excludes.is_some() {
-            found.retain(|&id| !self.excluded(id));
-        }
+        self.drop_excluded(&mut found);
         let max = self.req.max_results;
         if self.q.fuzzy_ok && found.len() < max.min(60) {
             let already: std::collections::HashSet<u32> = found.iter().copied().collect();

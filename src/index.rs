@@ -319,6 +319,21 @@ impl Index {
         }
     }
 
+    /// Appends the path relative to the entry's root ("Projects/omarchy-find");
+    /// nothing for a root itself. Recursive, so callers can reuse `out`
+    /// without a per-call chain.
+    pub fn rel_path(&self, id: u32, out: &mut Vec<u8>) {
+        if id == VROOT || self.is_root(id) {
+            return;
+        }
+        let parent = self.entries[id as usize].parent;
+        if parent != VROOT && !self.is_root(parent) {
+            self.rel_path(parent, out);
+            out.push(b'/');
+        }
+        out.extend_from_slice(self.name(id));
+    }
+
     pub fn add_child(&mut self, parent: u32, name: &[u8], kind: Kind) -> u32 {
         let id = self.entries.len() as u32;
         let (name_off, fold_off, fold_len) = self.push_name(id, name);
