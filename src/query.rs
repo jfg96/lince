@@ -601,12 +601,12 @@ impl<'a> Scan<'a> {
                 .iter()
                 .map(|&id| {
                     let e = &index.entries[id as usize];
-                    let len = utf16_len(index.name(id));
                     if browse {
                         // Browsing orders by name, not length: leave
                         // names to the tie-break below.
                         return (pack(e.depth as u32, e.flags & HIDDEN, 0), id, true);
                     }
+                    let len = utf16_len(index.name(id));
                     let name = index.folded(id);
                     let mut exact = true;
                     let score = this.q.score_terms.iter().fold(0u32, |total, t| {
@@ -688,6 +688,9 @@ impl<'a> Scan<'a> {
 
 /// Length of a UTF-8 name in UTF-16 code units, the unit the protocol ranks by.
 fn utf16_len(name: &[u8]) -> u32 {
+    if name.is_ascii() {
+        return name.len() as u32;
+    }
     name.iter().map(|&b| match b {
         0x80..=0xbf => 0, // continuation byte
         0xf0..=0xff => 2, // 4-byte sequence: a surrogate pair
