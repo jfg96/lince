@@ -1,0 +1,36 @@
+{
+  "date": "2026-10-21",
+  "baseline": "v0.1.3 release asset",
+  "candidate": "v0.1.4 release asset",
+  "binary_sha256": {
+    "v0.1.3": "7d6bcde4da08c2ac67fe5e0b17e8b9b58c23711e538d6d2ef661bf5df454bbda",
+    "v0.1.4": "f574da8ab4c90bc7e446592b158d9c0b21c582f3756b72bcfe3568bfd949d27b"
+  },
+  "cpu": "Intel Core i7-14700HX",
+  "logical_cpus": 28,
+  "filesystem": "btrfs",
+  "cache": "warm",
+  "default_threads": {
+    "lince": 8
+  },
+  "files": {
+    "paired-home.json.gz": {
+      "sha256": "739ccd5cb5f512b7d813eb8b57ec4be8c9c4f8eda2e025deff01f7f4e3e98042"
+    },
+    "daemon-home.json.gz": {
+      "sha256": "5428e49f337435b466c675ad5344684e2a087f95ed94d9e639f48dd57b3e4cd0"
+    },
+    "paired-1m.json.gz": {
+      "sha256": "eb2babcd022353f37e6dab09917ddef786b08f29f15fc431100a997f069f59a2"
+    },
+    "daemon-1m.json.gz": {
+      "sha256": "055a9891baf2bb0cd9a4243d2a289496b6ec87301d7d9a7cafc7e1d225d73dba"
+    },
+    "paired-5m.json.gz": {
+      "sha256": "ec4cacc80a6899dcec06232646140e39963be519401511a52b0d78265ade45ad"
+    },
+    "daemon-5m.json.gz": {
+      "sha256": "c70f289a3c72ae32c955f848c1615bd6e6032399c7b2f485ecad0b8cdb821972"
+    }
+  }
+}
