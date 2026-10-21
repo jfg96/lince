@@ -411,11 +411,13 @@ mod tests {
         assert!(!w.fresh());
 
         // Same-tick changes are not lost to coarse ctimes: every poll keeps
-        // finding what changed since the previous one.
+        // finding what changed since the previous one. Which of "a" and "b"
+        // got the spare watch depends on the file system's listing order.
+        let polled = ["a", "b"].into_iter().find(|d| w.unwatched.contains(&lookup(&index, d).unwrap())).unwrap();
         for i in 0..20 {
-            std::fs::write(dir.0.join(format!("b/quick{i}.txt")), b"").unwrap();
+            std::fs::write(dir.0.join(format!("{polled}/quick{i}.txt")), b"").unwrap();
             w.retry(&mut index, 1, usize::MAX);
-            assert!(lookup(&index, &format!("b/quick{i}.txt")).is_some(), "quick{i}");
+            assert!(lookup(&index, &format!("{polled}/quick{i}.txt")).is_some(), "quick{i}");
         }
         // One directory per pass: still unwatched ones go to the back, so
         // passes take turns instead of retrying the same one forever.
