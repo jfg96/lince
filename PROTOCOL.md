@@ -54,7 +54,7 @@ When more than `max_results` entries match, they are ranked by score (lower is b
 ## Status (`"op": "status"`)
 
 ```json
-{"v":1,"version":"0.1.3","roots":["/home/me"],"exclude":[".git","node_modules"],
+{"v":1,"version":"0.1.4","roots":["/home/me"],"exclude":[".git","node_modules"],
  "entries":313860,"dead":5,"index_bytes":32594589,"rss_kib":41220,
  "watches":34413,"max_watches":471860,"unwatched":0,"poll_ms":0,
  "fresh":true,"generation":313871}
