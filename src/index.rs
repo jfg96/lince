@@ -41,6 +41,10 @@ pub enum Kind {
 pub const HIDDEN: u8 = 1;
 /// The remaining flag bits hold the index of the entry's root.
 pub const MAX_ROOTS: usize = 127;
+/// Set in `name_len` when the name is its own folded form and is read from
+/// the folded blob instead of being stored twice. Names are at most 255
+/// bytes on Linux, a root's path at most 4096.
+const SHARED: u16 = 0x8000;
 
 pub struct Root {
     pub path: PathBuf,
@@ -188,7 +192,8 @@ impl Index {
 
     pub fn name(&self, id: u32) -> &[u8] {
         let e = &self.entries[id as usize];
-        &self.names[e.name_off as usize..(e.name_off + e.name_len as u32) as usize]
+        let blob = if e.name_len & SHARED != 0 { &self.folded } else { &self.names };
+        &blob[e.name_off as usize..(e.name_off + (e.name_len & !SHARED) as u32) as usize]
     }
 
     pub fn folded(&self, id: u32) -> &[u8] {
@@ -249,19 +254,26 @@ impl Index {
         id
     }
 
-    /// Appends a name to both blobs; returns (name_off, fold_off, fold_len).
-    fn push_name(&mut self, id: u32, name: &[u8]) -> (u32, u32, u16) {
+    /// Appends a name to the blobs; returns (name_off, name_len, fold_off,
+    /// fold_len). Most names in a home are already lowercase ASCII: those
+    /// are stored once, in the folded blob, and marked SHARED.
+    fn push_name(&mut self, id: u32, name: &[u8]) -> (u32, u16, u32, u16) {
         self.make_room(name.len());
-        let name_off = self.names.len() as u32;
-        self.names.extend_from_slice(name);
         let fold_off = self.folded.len() as u32;
         fold_into(name, &mut self.folded);
         let fold_len = (self.folded.len() as u32 - fold_off).min(u16::MAX as u32) as u16;
         self.folded.truncate((fold_off + fold_len as u32) as usize);
+        let (name_off, name_len) = if name.len() < SHARED as usize && self.folded[fold_off as usize..] == *name {
+            (fold_off, name.len() as u16 | SHARED)
+        } else {
+            let name_off = self.names.len() as u32;
+            self.names.extend_from_slice(name);
+            (name_off, name.len().min(SHARED as usize - 1) as u16)
+        };
         self.folded.push(0);
         self.owner_off.push(fold_off);
         self.owner_id.push(id);
-        (name_off, fold_off, fold_len)
+        (name_off, name_len, fold_off, fold_len)
     }
 
     pub fn is_dir(&self, id: u32) -> bool {
@@ -336,7 +348,7 @@ impl Index {
 
     pub fn add_child(&mut self, parent: u32, name: &[u8], kind: Kind) -> u32 {
         let id = self.entries.len() as u32;
-        let (name_off, fold_off, fold_len) = self.push_name(id, name);
+        let (name_off, name_len, fold_off, fold_len) = self.push_name(id, name);
         let ext = if kind == Kind::File { self.intern_ext(name) } else { 0 };
         self.ext.push(ext);
         let p = self.entries[parent as usize];
@@ -353,7 +365,7 @@ impl Index {
             next_sibling: NONE,
             name_off,
             fold_off,
-            name_len: name.len() as u16,
+            name_len,
             fold_len,
             kind,
             flags,
@@ -437,13 +449,13 @@ impl Index {
     /// their derived hidden flag and depth are refreshed.
     pub fn rename(&mut self, id: u32, new_parent: u32, new_name: &[u8]) {
         self.unlink(id);
-        let (name_off, fold_off, fold_len) = self.push_name(id, new_name);
+        let (name_off, name_len, fold_off, fold_len) = self.push_name(id, new_name);
         if self.entries[id as usize].kind == Kind::File {
             self.ext[id as usize] = self.intern_ext(new_name);
         }
         let e = &mut self.entries[id as usize];
         e.name_off = name_off;
-        e.name_len = new_name.len() as u16;
+        e.name_len = name_len;
         e.fold_off = fold_off;
         e.fold_len = fold_len;
         self.link(new_parent, id);
@@ -834,6 +846,31 @@ pub(crate) mod tests {
         assert_eq!(idx.path(map[file as usize]), before);
         assert_eq!(idx.dead, 0);
         assert!(find(&idx, "Música").is_none());
+    }
+
+    #[test]
+    fn names_already_folded_are_stored_once() {
+        let (_dir, mut idx) = fixture();
+        let file = find(&idx, "a/b/file.txt").unwrap();
+        let musica = find(&idx, "Música").unwrap();
+        let names_before = idx.names.len();
+        assert_eq!(idx.name(file), b"file.txt");
+        assert_eq!(idx.name(musica), "Música".as_bytes());
+        // Only "Música", and the root's path if it has capitals, differ from
+        // their folded form.
+        let root = idx.roots[0].id;
+        let root_bytes = if idx.name(root) == idx.folded(root) { 0 } else { idx.name(root).len() };
+        assert_eq!(names_before, root_bytes + "Música".len());
+        idx.rename(file, idx.entries[file as usize].parent, b"Report.TXT");
+        assert_eq!(idx.name(file), b"Report.TXT");
+        assert_eq!(idx.folded(file), b"report.txt");
+        idx.rename(musica, idx.entries[musica as usize].parent, b"musica");
+        assert_eq!(idx.name(musica), b"musica");
+        assert_eq!(idx.names.len(), names_before + "Report.TXT".len());
+        let map = idx.compact();
+        assert_eq!(idx.name(map[file as usize]), b"Report.TXT");
+        assert_eq!(idx.name(map[musica as usize]), b"musica");
+        assert!(find(&idx, "a/b/Report.TXT").is_some());
     }
 
     #[test]
