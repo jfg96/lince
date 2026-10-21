@@ -176,6 +176,9 @@ impl Bits {
     fn get(&self, i: u32) -> bool {
         self.0[i as usize / 64] & (1 << (i % 64)) != 0
     }
+    fn count(&self) -> usize {
+        self.0.iter().map(|w| w.count_ones() as usize).sum()
+    }
     fn ones(&self) -> impl Iterator<Item = u32> + '_ {
         self.0.iter().enumerate().flat_map(|(w, &word)| {
             let mut word = word;
@@ -264,6 +267,9 @@ fn name_hits(index: &Index, term: &Term) -> Bits {
 /// answer, so the whole table costs one visit per directory.
 fn dir_path_hits(index: &Index, own: &Bits) -> Bits {
     let n = index.entries.len();
+    if let Some(hit) = subtree_hits(index, own, n / 32) {
+        return hit;
+    }
     let mut known = Bits::new(n);
     let mut hit = Bits::new(n);
     let mut chain = Vec::new();
@@ -284,6 +290,45 @@ fn dir_path_hits(index: &Index, own: &Bits) -> Bits {
         }
     }
     hit
+}
+
+/// `dir_path_hits` for a narrow term: marks the directories below each
+/// directory in `own`, roots excepted, walking only what it marks. Gives up
+/// (None) after visiting `budget` entries, when one pass over every
+/// directory is cheaper.
+fn subtree_hits(index: &Index, own: &Bits, budget: usize) -> Option<Bits> {
+    if own.count() > budget {
+        return None;
+    }
+    let mut hit = Bits::new(index.entries.len());
+    let mut stack = Vec::new();
+    let mut visited = 0usize;
+    for seed in own.ones() {
+        visited += 1;
+        if visited > budget {
+            return None;
+        }
+        if seed == VROOT || !index.is_dir(seed) || index.is_root(seed) || hit.get(seed) {
+            continue;
+        }
+        stack.push(seed);
+        while let Some(dir) = stack.pop() {
+            if hit.get(dir) {
+                continue;
+            }
+            hit.set(dir);
+            for kid in index.children(dir) {
+                visited += 1;
+                if visited > budget {
+                    return None;
+                }
+                if index.is_dir(kid) && !hit.get(kid) {
+                    stack.push(kid);
+                }
+            }
+        }
+    }
+    Some(hit)
 }
 
 /// Entries where a match of a "/" term ends. Names hold no "/", so the
@@ -514,10 +559,15 @@ impl<'a> Scan<'a> {
 
     /// One worker's share of the entry array: (basename hits, path hits).
     fn scan_range(&self, kind: Kind, from: usize, to: usize) -> (Vec<u32>, Vec<u32>) {
+        self.scan_ids(kind, from.max(1) as u32..to as u32)
+    }
+
+    /// `scan_range` over given ids, in the order given.
+    fn scan_ids(&self, kind: Kind, ids: impl Iterator<Item = u32>) -> (Vec<u32>, Vec<u32>) {
         let mut basename = Vec::new();
         let mut path = Vec::new();
         let terms = self.q.terms.len();
-        for id in from.max(1) as u32..to as u32 {
+        for id in ids {
             if !self.passes_filters(id, kind) {
                 continue;
             }
@@ -528,6 +578,56 @@ impl<'a> Scan<'a> {
             }
         }
         (basename, path)
+    }
+
+    /// Every id of `kind` that can match, ascending, when one term leaves at
+    /// most `budget`: a file needs that term in its name or its directory's
+    /// path, a directory in its own path. None when every term leaves more
+    /// and scanning all entries is cheaper.
+    fn candidates(&self, kind: Kind, mut budget: usize) -> Option<Vec<u32>> {
+        if self.q.browse {
+            return None;
+        }
+        let index = self.index;
+        let mut best: Option<Vec<u32>> = None;
+        for t in 0..self.q.terms.len() {
+            // Counting set bits is cheap; it rules out broad terms before
+            // any candidate is collected.
+            let lower = if kind == Kind::Dir { self.dirs[t].count() } else { self.names[t].count() };
+            if lower > budget {
+                continue;
+            }
+            let mut ids = Vec::new();
+            let fits = 'collect: {
+                if kind == Kind::File {
+                    for id in self.names[t].ones().filter(|&id| index.entries[id as usize].kind == Kind::File) {
+                        ids.push(id);
+                        if ids.len() > budget {
+                            break 'collect false;
+                        }
+                    }
+                }
+                for dir in self.dirs[t].ones() {
+                    if kind == Kind::Dir {
+                        ids.push(dir);
+                    } else {
+                        ids.extend(index.children(dir).filter(|&id| index.entries[id as usize].kind == Kind::File));
+                    }
+                    if ids.len() > budget {
+                        break 'collect false;
+                    }
+                }
+                true
+            };
+            if fits {
+                budget = ids.len();
+                best = Some(ids);
+            }
+        }
+        let mut ids = best?;
+        ids.sort_unstable();
+        ids.dedup();
+        Some(ids)
     }
 
     fn fuzzy_range(&self, kind: Kind, from: usize, to: usize) -> Vec<u32> {
@@ -546,7 +646,15 @@ impl<'a> Scan<'a> {
         let n = self.index.entries.len();
         let parts = ranges(n, workers(n));
         let this = &*self;
-        let chunks = map_parts(&parts, |&(a, b)| this.scan_range(kind, a, b));
+        // A narrow query checks its candidates instead of every entry; both
+        // visit ids in ascending order, so results and their order agree.
+        let chunks = match self.candidates(kind, n / 32) {
+            Some(ids) => {
+                let pieces: Vec<&[u32]> = ids.chunks(ids.len().div_ceil(workers(ids.len() * 8)).max(1)).collect();
+                map_parts(&pieces, |piece| this.scan_ids(kind, piece.iter().copied()))
+            }
+            None => map_parts(&parts, |&(a, b)| this.scan_range(kind, a, b)),
+        };
         let (mut basename, mut path) = (Vec::new(), Vec::new());
         for (b, p) in chunks {
             basename.extend(b);
