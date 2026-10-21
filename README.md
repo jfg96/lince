@@ -9,12 +9,12 @@ $ lince search hypr config
 …
 ```
 
-- **Fast:** about 3 ms per search on a 315k-entry home, and 10 ms on a million entries (details below).
+- **Fast:** about 1.5 ms per search on a 366k-entry home, and 7 ms on a million entries (details below).
 - **Fresh:** every directory is watched. Changes made before a search are always in its results, and a lost-event overflow is repaired automatically.
 - **Accent- and case-insensitive:** `cancion` finds `Canción`, `españa` finds `espana`, and names stored in NFD match too.
 - **Name, path and fuzzy passes**, plus filters for kind, extension, hidden files, roots, scopes, depth and gitignore-style excludes.
 - **Ranked:** when there are more matches than the client asked for, it keeps the best ones, not whichever came first.
-- **Light:** about 40 MB resident for 300k entries, no CPU when idle, and a 5.6 MB snapshot that restarts it in about 120 ms.
+- **Light:** about 43 MB resident for 366k entries, no CPU when idle, and a 6.6 MB snapshot that restarts it in about 70 ms.
 
 Used by [Omarchy Find](https://github.com/jfg96/omarchy-find), which fetches a pinned, checksum-verified lince release on first use and falls back to `fd` while lince is unavailable.
 
@@ -79,24 +79,29 @@ echo '{"query":"report","kinds":["f"],"extensions":["pdf"],"max_results":20}' | 
 ## How it works
 
 - **Compact entries:** each entry is a basename plus a reference to its parent directory (28 bytes). Renaming or moving a directory updates one entry however many descendants it has, and full paths are only rebuilt for the results that are returned.
-- **Prepared matching:** names live in one contiguous blob, folded once at index time. Each query term is a single SIMD substring search over that blob, which produces a bitset. Directory bitsets answer "does the path contain this term", and a parallel pass applies the filters. File extensions are interned per entry, so extension filters compare small integers.
+- **Prepared matching:** names live in one contiguous blob, folded once at index time. A name that is already its own folded form (most names in a home) is not stored a second time. Each query term is a single SIMD substring search over that blob, which produces a bitset. Directory bitsets answer "does the path contain this term", and a parallel pass applies the filters. File extensions are interned per entry, so extension filters compare small integers.
+- **Narrow queries stay small:** when a term matches few entries, directory hits come from walking the matching subtrees and only the candidates are checked, instead of passing over every entry. A term containing `/` starts from the entries whose name begins with its last part and checks a few ancestors, so no directory path is built. Per-query excludes decide each directory once and check files in parallel.
 - **Crawling:** a parallel walker reads `d_type` and never stats an entry. Each directory gets its inotify watch before it is read, so nothing created during the crawl is missed.
 - **Freshness:** all inotify events are applied before each query, and the handlers are idempotent. If the kernel queue overflows, or when loading a snapshot, lince stats every directory and re-reads only those whose ctime changed: creating, deleting or renaming an entry always changes its parent's ctime.
 - **Snapshot:** names are front-coded, written atomically on exit and every 10 minutes after changes. It is validated, not trusted, on load.
 
 ## Performance
 
-Measured on an Intel i7-14700HX laptop (28 logical CPUs), btrfs, warm cache. lince uses eight query workers by default. The paired 65-case suite compares the current engine with commit `bbd853e` (0.1.1) on identical frozen indices:
+Measured on an Intel i7-14700HX laptop (28 logical CPUs), btrfs, warm cache, with the published 0.1.3 and 0.1.4 binaries. lince uses eight query workers by default. The paired 65-case suite runs both on identical frozen indices; times are medians over cases of each case's median engine time:
 
-| Entries | Previous engine | Current engine | CPU per search (previous → current) |
+| | 366k home mirror | 964k synthetic | 4.8M synthetic |
 |---|---:|---:|---:|
-| 97,453 synthetic | 2.19 ms | **1.79 ms** | 7.00 → 5.17 ms |
-| 315,143 home mirror | 3.76 ms | **3.00 ms** | 11.50 → 8.67 ms |
-| 964,036 synthetic | 12.73 ms | **9.57 ms** | 40.67 → 30.00 ms |
+| All cases, 0.1.3 → 0.1.4 | 3.25 → **1.46 ms** | 9.62 → **7.29 ms** | 43.5 → **31.8 ms** |
+| Up to 1,000 matches | 2.88 → **0.89 ms** | 10.13 → **4.49 ms** | 47.8 → **14.5 ms** |
+| Over 100,000 matches | 5.64 → 5.91 ms | 12.92 → 11.58 ms | 44.4 → 41.5 ms |
+| CPU per search | 9.44 → 5.56 ms | 27.8 → 23.3 ms | 144 → 116 ms |
+| Index size | 32.5 → **27.6 MiB** | 75.0 → 69.8 MiB | 376 → 350 MiB |
+| Idle RSS after the suite | 45.4 → 42.3 MiB | 100 → 89 MiB | 471 → 428 MiB |
+| Ready from snapshot | 99 → 69 ms | 256 → 245 ms | 1164 → 1151 ms |
 
-Every measured response preserves the exact result arrays and match counts: **195/195 cases**. Workers are reused across requests, blob hits reuse an owner cursor, and boundary ties are partitioned instead of fully sorted. The protocol and snapshot format are unchanged.
+Every measured response preserves the exact result arrays, order and match counts: **195/195 cases**, plus 1,800 generated requests on the home mirror and the 964k tree. Queries with many matches still pass over the whole index and gain little; the home-mirror difference there is within run-to-run noise. The synthetic trees have far more capitalised and accented names than a real home (34% non-ASCII names, against 0.03% in the mirror), so the index saving on them is smaller.
 
-A separate 60-case query/category benchmark compares FSearch 0.3.2 with the current lince engine:
+A separate 60-case query/category benchmark compares FSearch 0.3.2 with lince 0.1.2 (measured 2026-10-14, not repeated since):
 
 | | FSearch | lince, including socket and JSON |
 |---|---:|---:|
@@ -122,5 +127,7 @@ cargo test --release
 bash tests/cli_test.sh               # search semantics through the CLI
 python3 tests/stress_updates.py target/release/lince   # live index vs a fresh one after random changes
 ```
+
+Changes to the engine are compared with the previous binary on frozen trees: `tests/bench_compare.py` (paired latency, exact results on 65 cases), `tests/parity.py` (exact results on generated requests) and `tests/bench_daemon.py` (startup and memory). See [bench/README.md](bench/README.md) for datasets and commands, and [RELEASING.md](RELEASING.md) for publishing a release.
 
 MIT licensed.
