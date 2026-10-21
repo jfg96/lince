@@ -174,6 +174,18 @@ impl Bits {
     fn get(&self, i: u32) -> bool {
         self.0[i as usize / 64] & (1 << (i % 64)) != 0
     }
+    fn ones(&self) -> impl Iterator<Item = u32> + '_ {
+        self.0.iter().enumerate().flat_map(|(w, &word)| {
+            let mut word = word;
+            std::iter::from_fn(move || {
+                (word != 0).then(|| {
+                    let bit = word.trailing_zeros();
+                    word &= word - 1;
+                    w as u32 * 64 + bit
+                })
+            })
+        })
+    }
 }
 
 /// Splits `0..n` (or a byte blob) into roughly equal ranges, one per worker.
@@ -245,9 +257,10 @@ fn name_hits(index: &Index, term: &Term) -> Bits {
 }
 
 /// Per term, per directory: does the directory's path below the root contain
-/// the term? Children inherit a parent's answer, so the whole table costs one
-/// visit per directory.
-fn dir_path_hits(index: &Index, term: &Term, names: &Bits, rel: &RelPaths) -> Bits {
+/// the term? `own` marks the entries where a match can end (names containing
+/// the term, or the anchors of a "/" term); children inherit a parent's
+/// answer, so the whole table costs one visit per directory.
+fn dir_path_hits(index: &Index, own: &Bits) -> Bits {
     let n = index.entries.len();
     let mut known = Bits::new(n);
     let mut hit = Bits::new(n);
@@ -261,8 +274,7 @@ fn dir_path_hits(index: &Index, term: &Term, names: &Bits, rel: &RelPaths) -> Bi
         }
         let mut inherited = cur != VROOT && !index.is_root(cur) && hit.get(cur);
         while let Some(d) = chain.pop() {
-            let own = if term.slash { term.finder.find(rel.get(d)).is_some() } else { names.get(d) };
-            inherited |= own;
+            inherited |= own.get(d);
             known.set(d);
             if inherited {
                 hit.set(d);
@@ -272,41 +284,57 @@ fn dir_path_hits(index: &Index, term: &Term, names: &Bits, rel: &RelPaths) -> Bi
     hit
 }
 
-/// Folded relative paths of every directory, built only for terms that
-/// contain "/" (they can span components, so names alone are not enough).
-struct RelPaths {
-    span: Vec<(u32, u32)>,
-    buf: Vec<u8>,
-}
-
-impl RelPaths {
-    fn empty() -> RelPaths {
-        RelPaths { span: Vec::new(), buf: Vec::new() }
-    }
-
-    fn build(index: &Index) -> RelPaths {
-        let mut rel = RelPaths { span: vec![(0, 0); index.entries.len()], buf: Vec::new() };
-        let mut queue: std::collections::VecDeque<u32> = index.roots.iter().map(|r| r.id).collect();
-        while let Some(dir) = queue.pop_front() {
-            for kid in index.children(dir).filter(|&k| index.is_dir(k)) {
-                let start = rel.buf.len();
-                if !index.is_root(dir) {
-                    let (a, b) = rel.span[dir as usize];
-                    rel.buf.extend_from_within(a as usize..b as usize);
-                    rel.buf.push(b'/');
-                }
-                rel.buf.extend_from_slice(index.folded(kid));
-                rel.span[kid as usize] = (start as u32, rel.buf.len() as u32);
-                queue.push_back(kid);
+/// Entries where a match of a "/" term ends. Names hold no "/", so the
+/// term's parts fall on consecutive components below the root: the first
+/// ends a component, the middle ones are whole components and the last
+/// starts one. A directory's path contains the term when it or an ancestor
+/// is an anchor, a file's when it is one or its directory's path contains
+/// the term, so no path has to be built.
+fn slash_anchors(index: &Index, term: &Term) -> Bits {
+    let parts: Vec<&[u8]> = term.folded.split(|&b| b == b'/').collect();
+    let last = parts.len() - 1;
+    let fits = |id: u32| {
+        let mut cur = id;
+        for (i, part) in parts.iter().enumerate().rev() {
+            if cur == VROOT || index.is_root(cur) {
+                return false;
+            }
+            let name = index.folded(cur);
+            let ok = if i == 0 {
+                name.ends_with(part)
+            } else if i == last {
+                name.starts_with(part)
+            } else {
+                name == *part
+            };
+            if !ok {
+                return false;
+            }
+            cur = index.entries[cur as usize].parent;
+        }
+        true
+    };
+    let part_hits = |part: &[u8]| {
+        name_hits(index, &Term { folded: part.to_vec(), finder: Finder::new(part).into_owned(), slash: false })
+    };
+    let mut anchors = Bits::new(index.entries.len());
+    if !parts[last].is_empty() {
+        for id in part_hits(parts[last]).ones().filter(|&id| fits(id)) {
+            anchors.set(id);
+        }
+    } else if !parts[last - 1].is_empty() {
+        // "…/": any child of a component that matches the rest.
+        for dir in part_hits(parts[last - 1]).ones().filter(|&id| index.is_dir(id)) {
+            for id in index.children(dir).filter(|&id| fits(id)) {
+                anchors.set(id);
             }
         }
-        rel
+    } else {
+        for id in (1..index.entries.len() as u32).filter(|&id| fits(id)) {
+            anchors.set(id);
+        }
     }
-
-    fn get(&self, dir: u32) -> &[u8] {
-        let (a, b) = self.span[dir as usize];
-        &self.buf[a as usize..b as usize]
-    }
+    anchors
 }
 
 struct Scan<'a> {
@@ -315,7 +343,6 @@ struct Scan<'a> {
     req: &'a Request,
     names: Vec<Bits>,
     dirs: Vec<Bits>,
-    rel: RelPaths,
     ext_ok: Vec<bool>,
     /// Indexed roots this request covers.
     allowed_roots: Vec<bool>,
@@ -350,16 +377,17 @@ impl<'a> Scan<'a> {
                 })
             })
             .collect();
-        let rel = if q.any_slash { RelPaths::build(index) } else { RelPaths::empty() };
-        let names: Vec<Bits> = q.terms.iter().map(|t| name_hits(index, t)).collect();
-        let dirs = q.terms.iter().zip(&names).map(|(t, n)| dir_path_hits(index, t, n, &rel)).collect();
+        // For a "/" term, `names` holds its anchors instead of name hits.
+        let names: Vec<Bits> =
+            q.terms.iter().map(|t| if t.slash { slash_anchors(index, t) } else { name_hits(index, t) }).collect();
+        let dirs = names.iter().map(|own| dir_path_hits(index, own)).collect();
         let ext_ok = index
             .ext_names
             .iter()
             .enumerate()
             .map(|(i, e)| i != 0 && q.exts.iter().any(|x| x == e))
             .collect();
-        Ok(Scan { index, q, req, names, dirs, rel, ext_ok, allowed_roots, scope_dirs, excluded_memo: HashMap::new() })
+        Ok(Scan { index, q, req, names, dirs, ext_ok, allowed_roots, scope_dirs, excluded_memo: HashMap::new() })
     }
 
     /// Filters that do not depend on the query text.
@@ -425,34 +453,19 @@ impl<'a> Scan<'a> {
         hit
     }
 
-    fn path_match(&self, id: u32, t: usize, tail: &mut Vec<u8>) -> bool {
+    fn path_match(&self, id: u32, t: usize) -> bool {
         let index = self.index;
         if index.is_dir(id) {
             return self.dirs[t].get(id);
         }
         let parent = index.entries[id as usize].parent;
-        if self.names[t].get(id) || self.dirs[t].get(parent) {
-            return true;
-        }
-        let term = &self.q.terms[t];
-        if term.slash && !index.is_root(parent) {
-            // A "/" term can straddle the parent path and the name.
-            let keep = term.folded.len().saturating_sub(1);
-            let ppath = self.rel.get(parent);
-            tail.clear();
-            tail.extend_from_slice(&ppath[ppath.len().saturating_sub(keep)..]);
-            tail.push(b'/');
-            tail.extend_from_slice(index.folded(id));
-            return term.finder.find(tail).is_some();
-        }
-        false
+        self.names[t].get(id) || self.dirs[t].get(parent)
     }
 
     /// One worker's share of the entry array: (basename hits, path hits).
     fn scan_range(&self, kind: Kind, from: usize, to: usize) -> (Vec<u32>, Vec<u32>) {
         let mut basename = Vec::new();
         let mut path = Vec::new();
-        let mut tail = Vec::new();
         let terms = self.q.terms.len();
         for id in from.max(1) as u32..to as u32 {
             if !self.passes_filters(id, kind) {
@@ -460,7 +473,7 @@ impl<'a> Scan<'a> {
             }
             if self.q.browse || (!self.q.any_slash && self.names.iter().all(|b| b.get(id))) {
                 basename.push(id);
-            } else if (0..terms).all(|t| self.path_match(id, t, &mut tail)) {
+            } else if (0..terms).all(|t| self.path_match(id, t)) {
                 path.push(id);
             }
         }
