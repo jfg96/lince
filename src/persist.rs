@@ -19,7 +19,7 @@ use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use crate::index::{crawl, ctime_ns, list_dir, settled, DirHook, Index, Kind};
+use crate::index::{crawl, ctime_ns, list_dir, settled, DirHook, IdMap, Index, Kind};
 
 const MAGIC: &[u8; 4] = b"LNC1";
 const VERSION: u32 = 1;
@@ -79,7 +79,7 @@ pub fn save(index: &Index, path: &Path) -> Result<(), String> {
     }
     put_varint(&mut out, (index.live - index.roots.len()) as u64);
     // Stream position of each written directory, for parent references.
-    let mut pos_of = std::collections::HashMap::with_capacity(index.dir_stamp.len() + 1);
+    let mut pos_of: IdMap<u64> = IdMap::with_capacity_and_hasher(index.dir_stamp.len() + 1, Default::default());
     for (i, r) in index.roots.iter().enumerate() {
         pos_of.insert(r.id, i as u64);
     }
@@ -150,6 +150,11 @@ pub fn load(path: &Path, roots: &[PathBuf], patterns: &[String]) -> Result<Index
         index.dir_stamp.insert(root.id, *stamp);
     }
     let total = r.varint()? as usize;
+    // Sized only after the stream has been read through, so a corrupt
+    // count cannot ask for a huge reservation.
+    let (dirs, name_bytes, longest) = measure(Reader { buf: r.buf, pos: r.pos }, total)?;
+    index.reserve(total, dirs, name_bytes, longest);
+    id_at.reserve_exact(total);
     let mut prev: Vec<u8> = Vec::new();
     for _ in 0..total {
         let parent_pos = r.varint()? as usize;
@@ -180,6 +185,35 @@ pub fn load(path: &Path, roots: &[PathBuf], patterns: &[String]) -> Result<Index
     }
     index.shrink();
     Ok(index)
+}
+
+/// Walks the entry stream without building anything: (directories, total
+/// name bytes, longest name). Rejects what the loading pass would reject
+/// before reaching the end of the stream.
+fn measure(mut r: Reader, total: usize) -> Result<(usize, usize, usize), String> {
+    let (mut dirs, mut name_bytes, mut longest, mut prev) = (0usize, 0usize, 0usize, 0usize);
+    for _ in 0..total {
+        r.varint()?;
+        let kind = r.bytes(1)?[0];
+        let keep = r.varint()? as usize;
+        let suffix = r.varint()? as usize;
+        if keep > prev {
+            return Err("corrupt snapshot".into());
+        }
+        r.bytes(suffix)?;
+        prev = keep + suffix;
+        name_bytes = name_bytes.saturating_add(prev);
+        longest = longest.max(prev);
+        match kind {
+            1 => {
+                r.bytes(8)?;
+                dirs += 1;
+            }
+            2 => {}
+            _ => return Err("bad entry kind".into()),
+        }
+    }
+    Ok((dirs, name_bytes, longest))
 }
 
 /// Brings an index up to date with the disk by re-reading only directories

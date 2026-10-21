@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex};
@@ -69,7 +70,7 @@ pub struct Index {
     /// ctime of each directory when it was last read. A directory's ctime
     /// changes whenever an entry is created, removed or renamed in it, which
     /// makes it a cheap way to validate a persisted index.
-    pub dir_stamp: HashMap<u32, i64>,
+    pub dir_stamp: IdMap<i64>,
     pub exclude_patterns: Vec<String>,
     pub live: usize,
     pub dead: usize,
@@ -91,7 +92,7 @@ pub struct Index {
     /// a colliding name falls back to the sibling scan), so events in huge directories do not turn
     /// every lookup into a scan of the sibling list.
     kid_count: Vec<u32>,
-    wide: HashMap<u32, HashMap<u64, u32>>,
+    wide: IdMap<HashMap<u64, u32>>,
 }
 
 const WIDE: u32 = 64;
@@ -132,7 +133,7 @@ impl Index {
             entries: Vec::new(),
             names: Vec::new(),
             folded: Vec::new(),
-            dir_stamp: HashMap::new(),
+            dir_stamp: IdMap::default(),
             exclude_patterns: patterns.to_vec(),
             live: 0,
             dead: 0,
@@ -143,7 +144,7 @@ impl Index {
             ext_names: vec![Vec::new()],
             ext_ids: HashMap::new(),
             kid_count: vec![0],
-            wide: HashMap::new(),
+            wide: IdMap::default(),
         };
         index.folded.push(0);
         index.entries.push(Entry {
@@ -223,10 +224,22 @@ impl Index {
     fn intern_ext(&mut self, name: &[u8]) -> u16 {
         // Same rule as fd -e: a suffix after a dot that is not the first byte.
         let Some(dot) = memchr::memrchr(b'.', name).filter(|&d| d > 0 && d + 1 < name.len()) else { return 0 };
-        let ext = name[dot + 1..].to_ascii_lowercase();
-        if let Some(&id) = self.ext_ids.get(&ext) {
+        let ext = &name[dot + 1..];
+        // Lowercase short extensions on the stack: this runs for every file
+        // that is indexed or loaded.
+        let mut buf = [0u8; 16];
+        let lower = if ext.len() <= buf.len() {
+            let buf = &mut buf[..ext.len()];
+            buf.copy_from_slice(ext);
+            buf.make_ascii_lowercase();
+            &*buf
+        } else {
+            &ext.to_ascii_lowercase()[..]
+        };
+        if let Some(&id) = self.ext_ids.get(lower) {
             return id;
         }
+        let ext = lower.to_vec();
         if self.ext_names.len() >= u16::MAX as usize {
             return u16::MAX; // table full: callers fall back to the name
         }
@@ -450,7 +463,7 @@ impl Index {
             entries: Vec::with_capacity(self.live + 1),
             names: Vec::with_capacity(self.names.len()),
             folded: Vec::with_capacity(self.folded.len()),
-            dir_stamp: HashMap::with_capacity(self.dir_stamp.len()),
+            dir_stamp: IdMap::with_capacity_and_hasher(self.dir_stamp.len(), Default::default()),
             exclude_patterns: self.exclude_patterns.clone(),
             live: 0,
             dead: 0,
@@ -461,7 +474,7 @@ impl Index {
             ext_names: vec![Vec::new()],
             ext_ids: HashMap::new(),
             kid_count: vec![0],
-            wide: HashMap::new(),
+            wide: IdMap::default(),
         };
         fresh.folded.push(0);
         fresh.entries.push(self.entries[0]);
@@ -511,6 +524,23 @@ impl Index {
         self.dir_stamp.shrink_to_fit();
     }
 
+    /// Makes room for `entries` more entries, `dirs` of them directories,
+    /// whose names add up to `name_bytes`, so a load of known size does not
+    /// grow the arrays an eighth at a time. Best effort: if a reservation
+    /// fails, make_room grows the arrays as usual.
+    pub fn reserve(&mut self, entries: usize, dirs: usize, name_bytes: usize, longest: usize) {
+        let _ = self.entries.try_reserve_exact(entries);
+        let _ = self.ext.try_reserve_exact(entries);
+        let _ = self.kid_count.try_reserve_exact(entries);
+        let _ = self.owner_off.try_reserve_exact(entries);
+        let _ = self.owner_id.try_reserve_exact(entries);
+        let _ = self.names.try_reserve_exact(name_bytes);
+        // Folded names usually keep their length; make_room also wants
+        // worst-case space for the name being added, plus each NUL.
+        let _ = self.folded.try_reserve_exact(name_bytes.saturating_add(entries).saturating_add(longest * 3 + 1));
+        let _ = self.dir_stamp.try_reserve(dirs);
+    }
+
     /// Grows the arrays by an eighth instead of doubling them, so the first
     /// change after a shrink() does not double the resident index.
     fn make_room(&mut self, name_len: usize) {
@@ -542,6 +572,33 @@ impl Index {
     /// Every live directory, roots included, the virtual node excluded.
     pub fn live_dirs(&self) -> impl Iterator<Item = u32> + '_ {
         (1..self.entries.len() as u32).filter(|&i| self.entries[i as usize].kind == Kind::Dir)
+    }
+}
+
+/// Map keyed by entry id. Ids are assigned by lince, never chosen by whoever
+/// names the files, so SipHash's flooding resistance buys nothing here while
+/// its cost shows on every insert when millions of entries are loaded.
+pub type IdMap<V> = HashMap<u32, V, BuildHasherDefault<IdHasher>>;
+
+#[derive(Default)]
+pub struct IdHasher(u64);
+
+impl Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(self.0 ^ b as u64);
+        }
+    }
+    fn write_u32(&mut self, n: u32) {
+        self.write_u64(n as u64);
+    }
+    fn write_u64(&mut self, n: u64) {
+        // Fibonacci hashing: distinct ids keep distinct low bits (the bucket)
+        // and the multiply spreads them into the high bits (the tag).
+        self.0 = n.wrapping_mul(0x9e37_79b9_7f4a_7c15);
     }
 }
 
