@@ -16,6 +16,8 @@
 //! there are more than `max_results`, the best-ranked ones are kept.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use memchr::memmem::Finder;
@@ -23,7 +25,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::fold::{fold, is_subsequence};
-use crate::index::{build_excludes, Index, Kind, HIDDEN, VROOT};
+use crate::index::{build_excludes, IdMap, Index, Kind, HIDDEN, VROOT};
 
 /// Protocol version, reported in every response.
 pub const PROTOCOL: u32 = 1;
@@ -174,6 +176,21 @@ impl Bits {
     fn get(&self, i: u32) -> bool {
         self.0[i as usize / 64] & (1 << (i % 64)) != 0
     }
+    fn count(&self) -> usize {
+        self.0.iter().map(|w| w.count_ones() as usize).sum()
+    }
+    fn ones(&self) -> impl Iterator<Item = u32> + '_ {
+        self.0.iter().enumerate().flat_map(|(w, &word)| {
+            let mut word = word;
+            std::iter::from_fn(move || {
+                (word != 0).then(|| {
+                    let bit = word.trailing_zeros();
+                    word &= word - 1;
+                    w as u32 * 64 + bit
+                })
+            })
+        })
+    }
 }
 
 /// Splits `0..n` (or a byte blob) into roughly equal ranges, one per worker.
@@ -245,10 +262,14 @@ fn name_hits(index: &Index, term: &Term) -> Bits {
 }
 
 /// Per term, per directory: does the directory's path below the root contain
-/// the term? Children inherit a parent's answer, so the whole table costs one
-/// visit per directory.
-fn dir_path_hits(index: &Index, term: &Term, names: &Bits, rel: &RelPaths) -> Bits {
+/// the term? `own` marks the entries where a match can end (names containing
+/// the term, or the anchors of a "/" term); children inherit a parent's
+/// answer, so the whole table costs one visit per directory.
+fn dir_path_hits(index: &Index, own: &Bits) -> Bits {
     let n = index.entries.len();
+    if let Some(hit) = subtree_hits(index, own, n / 32) {
+        return hit;
+    }
     let mut known = Bits::new(n);
     let mut hit = Bits::new(n);
     let mut chain = Vec::new();
@@ -261,8 +282,7 @@ fn dir_path_hits(index: &Index, term: &Term, names: &Bits, rel: &RelPaths) -> Bi
         }
         let mut inherited = cur != VROOT && !index.is_root(cur) && hit.get(cur);
         while let Some(d) = chain.pop() {
-            let own = if term.slash { term.finder.find(rel.get(d)).is_some() } else { names.get(d) };
-            inherited |= own;
+            inherited |= own.get(d);
             known.set(d);
             if inherited {
                 hit.set(d);
@@ -272,41 +292,96 @@ fn dir_path_hits(index: &Index, term: &Term, names: &Bits, rel: &RelPaths) -> Bi
     hit
 }
 
-/// Folded relative paths of every directory, built only for terms that
-/// contain "/" (they can span components, so names alone are not enough).
-struct RelPaths {
-    span: Vec<(u32, u32)>,
-    buf: Vec<u8>,
-}
-
-impl RelPaths {
-    fn empty() -> RelPaths {
-        RelPaths { span: Vec::new(), buf: Vec::new() }
+/// `dir_path_hits` for a narrow term: marks the directories below each
+/// directory in `own`, roots excepted, walking only what it marks. Gives up
+/// (None) after visiting `budget` entries, when one pass over every
+/// directory is cheaper.
+fn subtree_hits(index: &Index, own: &Bits, budget: usize) -> Option<Bits> {
+    if own.count() > budget {
+        return None;
     }
-
-    fn build(index: &Index) -> RelPaths {
-        let mut rel = RelPaths { span: vec![(0, 0); index.entries.len()], buf: Vec::new() };
-        let mut queue: std::collections::VecDeque<u32> = index.roots.iter().map(|r| r.id).collect();
-        while let Some(dir) = queue.pop_front() {
-            for kid in index.children(dir).filter(|&k| index.is_dir(k)) {
-                let start = rel.buf.len();
-                if !index.is_root(dir) {
-                    let (a, b) = rel.span[dir as usize];
-                    rel.buf.extend_from_within(a as usize..b as usize);
-                    rel.buf.push(b'/');
+    let mut hit = Bits::new(index.entries.len());
+    let mut stack = Vec::new();
+    let mut visited = 0usize;
+    for seed in own.ones() {
+        visited += 1;
+        if visited > budget {
+            return None;
+        }
+        if seed == VROOT || !index.is_dir(seed) || index.is_root(seed) || hit.get(seed) {
+            continue;
+        }
+        stack.push(seed);
+        while let Some(dir) = stack.pop() {
+            if hit.get(dir) {
+                continue;
+            }
+            hit.set(dir);
+            for kid in index.children(dir) {
+                visited += 1;
+                if visited > budget {
+                    return None;
                 }
-                rel.buf.extend_from_slice(index.folded(kid));
-                rel.span[kid as usize] = (start as u32, rel.buf.len() as u32);
-                queue.push_back(kid);
+                if index.is_dir(kid) && !hit.get(kid) {
+                    stack.push(kid);
+                }
             }
         }
-        rel
     }
+    Some(hit)
+}
 
-    fn get(&self, dir: u32) -> &[u8] {
-        let (a, b) = self.span[dir as usize];
-        &self.buf[a as usize..b as usize]
+/// Entries where a match of a "/" term ends. Names hold no "/", so the
+/// term's parts fall on consecutive components below the root: the first
+/// ends a component, the middle ones are whole components and the last
+/// starts one. A directory's path contains the term when it or an ancestor
+/// is an anchor, a file's when it is one or its directory's path contains
+/// the term, so no path has to be built.
+fn slash_anchors(index: &Index, term: &Term) -> Bits {
+    let parts: Vec<&[u8]> = term.folded.split(|&b| b == b'/').collect();
+    let last = parts.len() - 1;
+    let fits = |id: u32| {
+        let mut cur = id;
+        for (i, part) in parts.iter().enumerate().rev() {
+            if cur == VROOT || index.is_root(cur) {
+                return false;
+            }
+            let name = index.folded(cur);
+            let ok = if i == 0 {
+                name.ends_with(part)
+            } else if i == last {
+                name.starts_with(part)
+            } else {
+                name == *part
+            };
+            if !ok {
+                return false;
+            }
+            cur = index.entries[cur as usize].parent;
+        }
+        true
+    };
+    let part_hits = |part: &[u8]| {
+        name_hits(index, &Term { folded: part.to_vec(), finder: Finder::new(part).into_owned(), slash: false })
+    };
+    let mut anchors = Bits::new(index.entries.len());
+    if !parts[last].is_empty() {
+        for id in part_hits(parts[last]).ones().filter(|&id| fits(id)) {
+            anchors.set(id);
+        }
+    } else if !parts[last - 1].is_empty() {
+        // "…/": any child of a component that matches the rest.
+        for dir in part_hits(parts[last - 1]).ones().filter(|&id| index.is_dir(id)) {
+            for id in index.children(dir).filter(|&id| fits(id)) {
+                anchors.set(id);
+            }
+        }
+    } else {
+        for id in (1..index.entries.len() as u32).filter(|&id| fits(id)) {
+            anchors.set(id);
+        }
     }
+    anchors
 }
 
 struct Scan<'a> {
@@ -315,12 +390,13 @@ struct Scan<'a> {
     req: &'a Request,
     names: Vec<Bits>,
     dirs: Vec<Bits>,
-    rel: RelPaths,
     ext_ok: Vec<bool>,
     /// Indexed roots this request covers.
     allowed_roots: Vec<bool>,
     scope_dirs: Vec<u32>,
-    excluded_memo: HashMap<u32, bool>,
+    /// Exclusion of directories already checked; files are checked once.
+    excluded_memo: IdMap<bool>,
+    rel_buf: Vec<u8>,
 }
 
 impl<'a> Scan<'a> {
@@ -350,16 +426,17 @@ impl<'a> Scan<'a> {
                 })
             })
             .collect();
-        let rel = if q.any_slash { RelPaths::build(index) } else { RelPaths::empty() };
-        let names: Vec<Bits> = q.terms.iter().map(|t| name_hits(index, t)).collect();
-        let dirs = q.terms.iter().zip(&names).map(|(t, n)| dir_path_hits(index, t, n, &rel)).collect();
+        // For a "/" term, `names` holds its anchors instead of name hits.
+        let names: Vec<Bits> =
+            q.terms.iter().map(|t| if t.slash { slash_anchors(index, t) } else { name_hits(index, t) }).collect();
+        let dirs = names.iter().map(|own| dir_path_hits(index, own)).collect();
         let ext_ok = index
             .ext_names
             .iter()
             .enumerate()
             .map(|(i, e)| i != 0 && q.exts.iter().any(|x| x == e))
             .collect();
-        Ok(Scan { index, q, req, names, dirs, rel, ext_ok, allowed_roots, scope_dirs, excluded_memo: HashMap::new() })
+        Ok(Scan { index, q, req, names, dirs, ext_ok, allowed_roots, scope_dirs, excluded_memo: IdMap::default(), rel_buf: Vec::new() })
     }
 
     /// Filters that do not depend on the query text.
@@ -408,63 +485,149 @@ impl<'a> Scan<'a> {
     /// Per-query excludes beyond the ones the index was built with: an entry
     /// is excluded when it or any ancestor matches, as fd prunes the walk.
     fn excluded(&mut self, id: u32) -> bool {
-        let Some(overrides) = &self.q.extra_excludes else { return false };
+        let q = self.q;
+        let Some(overrides) = &q.extra_excludes else { return false };
         if id == VROOT || self.index.is_root(id) {
             return false;
         }
-        let ov = &overrides[self.index.root_of(id)];
         if let Some(&v) = self.excluded_memo.get(&id) {
             return v;
         }
-        let is_dir = self.index.is_dir(id);
-        let hit = ov.matched(self.index.path(id), is_dir).is_ignore() || {
-            let parent = self.index.entries[id as usize].parent;
-            self.excluded(parent)
+        let parent = self.index.entries[id as usize].parent;
+        let hit = self.excluded(parent) || {
+            let mut buf = std::mem::take(&mut self.rel_buf);
+            let own = self.matches_exclude(overrides, id, &mut buf);
+            self.rel_buf = buf;
+            own
         };
-        self.excluded_memo.insert(id, hit);
+        if self.index.is_dir(id) {
+            self.excluded_memo.insert(id, hit);
+        }
         hit
     }
 
-    fn path_match(&self, id: u32, t: usize, tail: &mut Vec<u8>) -> bool {
+    /// Whether the per-query excludes match the entry itself, ignoring its
+    /// ancestors. The matcher strips the root from an absolute path; a path
+    /// relative to the root matches the same without building the absolute one.
+    fn matches_exclude(&self, overrides: &[ignore::overrides::Override], id: u32, buf: &mut Vec<u8>) -> bool {
+        buf.clear();
+        self.index.rel_path(id, buf);
+        let ov = &overrides[self.index.root_of(id)];
+        ov.matched(Path::new(OsStr::from_bytes(buf)), self.index.is_dir(id)).is_ignore()
+    }
+
+    /// Drops excluded candidates, keeping their order. Directories are
+    /// decided first, once each and parents before children; a file then
+    /// only needs its own name matched, which runs on the workers.
+    fn drop_excluded(&mut self, found: &mut Vec<u32>) {
+        let q = self.q;
+        let Some(overrides) = &q.extra_excludes else { return };
+        let index = self.index;
+        for &id in found.iter() {
+            self.excluded(if index.is_dir(id) { id } else { index.entries[id as usize].parent });
+        }
+        let this = &*self;
+        // A root is never excluded and is not memoised: absent means false.
+        let known = |id: u32| this.excluded_memo.get(&id).copied().unwrap_or(false);
+        let chunks: Vec<&[u32]> = found.chunks(found.len().div_ceil(workers(found.len() * 8)).max(1)).collect();
+        let kept = map_parts(&chunks, |chunk| {
+            let mut buf = Vec::new();
+            chunk
+                .iter()
+                .copied()
+                .filter(|&id| {
+                    let excluded = if index.is_dir(id) {
+                        known(id)
+                    } else {
+                        known(index.entries[id as usize].parent) || this.matches_exclude(overrides, id, &mut buf)
+                    };
+                    !excluded
+                })
+                .collect::<Vec<u32>>()
+        });
+        *found = kept.into_iter().flatten().collect();
+    }
+
+    fn path_match(&self, id: u32, t: usize) -> bool {
         let index = self.index;
         if index.is_dir(id) {
             return self.dirs[t].get(id);
         }
         let parent = index.entries[id as usize].parent;
-        if self.names[t].get(id) || self.dirs[t].get(parent) {
-            return true;
-        }
-        let term = &self.q.terms[t];
-        if term.slash && !index.is_root(parent) {
-            // A "/" term can straddle the parent path and the name.
-            let keep = term.folded.len().saturating_sub(1);
-            let ppath = self.rel.get(parent);
-            tail.clear();
-            tail.extend_from_slice(&ppath[ppath.len().saturating_sub(keep)..]);
-            tail.push(b'/');
-            tail.extend_from_slice(index.folded(id));
-            return term.finder.find(tail).is_some();
-        }
-        false
+        self.names[t].get(id) || self.dirs[t].get(parent)
     }
 
     /// One worker's share of the entry array: (basename hits, path hits).
     fn scan_range(&self, kind: Kind, from: usize, to: usize) -> (Vec<u32>, Vec<u32>) {
+        self.scan_ids(kind, from.max(1) as u32..to as u32)
+    }
+
+    /// `scan_range` over given ids, in the order given.
+    fn scan_ids(&self, kind: Kind, ids: impl Iterator<Item = u32>) -> (Vec<u32>, Vec<u32>) {
         let mut basename = Vec::new();
         let mut path = Vec::new();
-        let mut tail = Vec::new();
         let terms = self.q.terms.len();
-        for id in from.max(1) as u32..to as u32 {
+        for id in ids {
             if !self.passes_filters(id, kind) {
                 continue;
             }
             if self.q.browse || (!self.q.any_slash && self.names.iter().all(|b| b.get(id))) {
                 basename.push(id);
-            } else if (0..terms).all(|t| self.path_match(id, t, &mut tail)) {
+            } else if (0..terms).all(|t| self.path_match(id, t)) {
                 path.push(id);
             }
         }
         (basename, path)
+    }
+
+    /// Every id of `kind` that can match, ascending, when one term leaves at
+    /// most `budget`: a file needs that term in its name or its directory's
+    /// path, a directory in its own path. None when every term leaves more
+    /// and scanning all entries is cheaper.
+    fn candidates(&self, kind: Kind, mut budget: usize) -> Option<Vec<u32>> {
+        if self.q.browse {
+            return None;
+        }
+        let index = self.index;
+        let mut best: Option<Vec<u32>> = None;
+        for t in 0..self.q.terms.len() {
+            // Counting set bits is cheap; it rules out broad terms before
+            // any candidate is collected.
+            let lower = if kind == Kind::Dir { self.dirs[t].count() } else { self.names[t].count() };
+            if lower > budget {
+                continue;
+            }
+            let mut ids = Vec::new();
+            let fits = 'collect: {
+                if kind == Kind::File {
+                    for id in self.names[t].ones().filter(|&id| index.entries[id as usize].kind == Kind::File) {
+                        ids.push(id);
+                        if ids.len() > budget {
+                            break 'collect false;
+                        }
+                    }
+                }
+                for dir in self.dirs[t].ones() {
+                    if kind == Kind::Dir {
+                        ids.push(dir);
+                    } else {
+                        ids.extend(index.children(dir).filter(|&id| index.entries[id as usize].kind == Kind::File));
+                    }
+                    if ids.len() > budget {
+                        break 'collect false;
+                    }
+                }
+                true
+            };
+            if fits {
+                budget = ids.len();
+                best = Some(ids);
+            }
+        }
+        let mut ids = best?;
+        ids.sort_unstable();
+        ids.dedup();
+        Some(ids)
     }
 
     fn fuzzy_range(&self, kind: Kind, from: usize, to: usize) -> Vec<u32> {
@@ -483,7 +646,15 @@ impl<'a> Scan<'a> {
         let n = self.index.entries.len();
         let parts = ranges(n, workers(n));
         let this = &*self;
-        let chunks = map_parts(&parts, |&(a, b)| this.scan_range(kind, a, b));
+        // A narrow query checks its candidates instead of every entry; both
+        // visit ids in ascending order, so results and their order agree.
+        let chunks = match self.candidates(kind, n / 32) {
+            Some(ids) => {
+                let pieces: Vec<&[u32]> = ids.chunks(ids.len().div_ceil(workers(ids.len() * 8)).max(1)).collect();
+                map_parts(&pieces, |piece| this.scan_ids(kind, piece.iter().copied()))
+            }
+            None => map_parts(&parts, |&(a, b)| this.scan_range(kind, a, b)),
+        };
         let (mut basename, mut path) = (Vec::new(), Vec::new());
         for (b, p) in chunks {
             basename.extend(b);
@@ -491,9 +662,7 @@ impl<'a> Scan<'a> {
         }
         let mut found = basename;
         found.extend(path);
-        if self.q.extra_excludes.is_some() {
-            found.retain(|&id| !self.excluded(id));
-        }
+        self.drop_excluded(&mut found);
         let max = self.req.max_results;
         if self.q.fuzzy_ok && found.len() < max.min(60) {
             let already: std::collections::HashSet<u32> = found.iter().copied().collect();
@@ -540,12 +709,12 @@ impl<'a> Scan<'a> {
                 .iter()
                 .map(|&id| {
                     let e = &index.entries[id as usize];
-                    let len = utf16_len(index.name(id));
                     if browse {
                         // Browsing orders by name, not length: leave
                         // names to the tie-break below.
                         return (pack(e.depth as u32, e.flags & HIDDEN, 0), id, true);
                     }
+                    let len = utf16_len(index.name(id));
                     let name = index.folded(id);
                     let mut exact = true;
                     let score = this.q.score_terms.iter().fold(0u32, |total, t| {
@@ -627,6 +796,9 @@ impl<'a> Scan<'a> {
 
 /// Length of a UTF-8 name in UTF-16 code units, the unit the protocol ranks by.
 fn utf16_len(name: &[u8]) -> u32 {
+    if name.is_ascii() {
+        return name.len() as u32;
+    }
     name.iter().map(|&b| match b {
         0x80..=0xbf => 0, // continuation byte
         0xf0..=0xff => 2, // 4-byte sequence: a surrogate pair

@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex};
@@ -40,6 +41,10 @@ pub enum Kind {
 pub const HIDDEN: u8 = 1;
 /// The remaining flag bits hold the index of the entry's root.
 pub const MAX_ROOTS: usize = 127;
+/// Set in `name_len` when the name is its own folded form and is read from
+/// the folded blob instead of being stored twice. Names are at most 255
+/// bytes on Linux, a root's path at most 4096.
+const SHARED: u16 = 0x8000;
 
 pub struct Root {
     pub path: PathBuf,
@@ -69,7 +74,7 @@ pub struct Index {
     /// ctime of each directory when it was last read. A directory's ctime
     /// changes whenever an entry is created, removed or renamed in it, which
     /// makes it a cheap way to validate a persisted index.
-    pub dir_stamp: HashMap<u32, i64>,
+    pub dir_stamp: IdMap<i64>,
     pub exclude_patterns: Vec<String>,
     pub live: usize,
     pub dead: usize,
@@ -91,7 +96,7 @@ pub struct Index {
     /// a colliding name falls back to the sibling scan), so events in huge directories do not turn
     /// every lookup into a scan of the sibling list.
     kid_count: Vec<u32>,
-    wide: HashMap<u32, HashMap<u64, u32>>,
+    wide: IdMap<HashMap<u64, u32>>,
 }
 
 const WIDE: u32 = 64;
@@ -132,7 +137,7 @@ impl Index {
             entries: Vec::new(),
             names: Vec::new(),
             folded: Vec::new(),
-            dir_stamp: HashMap::new(),
+            dir_stamp: IdMap::default(),
             exclude_patterns: patterns.to_vec(),
             live: 0,
             dead: 0,
@@ -143,7 +148,7 @@ impl Index {
             ext_names: vec![Vec::new()],
             ext_ids: HashMap::new(),
             kid_count: vec![0],
-            wide: HashMap::new(),
+            wide: IdMap::default(),
         };
         index.folded.push(0);
         index.entries.push(Entry {
@@ -187,7 +192,8 @@ impl Index {
 
     pub fn name(&self, id: u32) -> &[u8] {
         let e = &self.entries[id as usize];
-        &self.names[e.name_off as usize..(e.name_off + e.name_len as u32) as usize]
+        let blob = if e.name_len & SHARED != 0 { &self.folded } else { &self.names };
+        &blob[e.name_off as usize..(e.name_off + (e.name_len & !SHARED) as u32) as usize]
     }
 
     pub fn folded(&self, id: u32) -> &[u8] {
@@ -223,10 +229,22 @@ impl Index {
     fn intern_ext(&mut self, name: &[u8]) -> u16 {
         // Same rule as fd -e: a suffix after a dot that is not the first byte.
         let Some(dot) = memchr::memrchr(b'.', name).filter(|&d| d > 0 && d + 1 < name.len()) else { return 0 };
-        let ext = name[dot + 1..].to_ascii_lowercase();
-        if let Some(&id) = self.ext_ids.get(&ext) {
+        let ext = &name[dot + 1..];
+        // Lowercase short extensions on the stack: this runs for every file
+        // that is indexed or loaded.
+        let mut buf = [0u8; 16];
+        let lower = if ext.len() <= buf.len() {
+            let buf = &mut buf[..ext.len()];
+            buf.copy_from_slice(ext);
+            buf.make_ascii_lowercase();
+            &*buf
+        } else {
+            &ext.to_ascii_lowercase()[..]
+        };
+        if let Some(&id) = self.ext_ids.get(lower) {
             return id;
         }
+        let ext = lower.to_vec();
         if self.ext_names.len() >= u16::MAX as usize {
             return u16::MAX; // table full: callers fall back to the name
         }
@@ -236,19 +254,26 @@ impl Index {
         id
     }
 
-    /// Appends a name to both blobs; returns (name_off, fold_off, fold_len).
-    fn push_name(&mut self, id: u32, name: &[u8]) -> (u32, u32, u16) {
+    /// Appends a name to the blobs; returns (name_off, name_len, fold_off,
+    /// fold_len). Most names in a home are already lowercase ASCII: those
+    /// are stored once, in the folded blob, and marked SHARED.
+    fn push_name(&mut self, id: u32, name: &[u8]) -> (u32, u16, u32, u16) {
         self.make_room(name.len());
-        let name_off = self.names.len() as u32;
-        self.names.extend_from_slice(name);
         let fold_off = self.folded.len() as u32;
         fold_into(name, &mut self.folded);
         let fold_len = (self.folded.len() as u32 - fold_off).min(u16::MAX as u32) as u16;
         self.folded.truncate((fold_off + fold_len as u32) as usize);
+        let (name_off, name_len) = if name.len() < SHARED as usize && self.folded[fold_off as usize..] == *name {
+            (fold_off, name.len() as u16 | SHARED)
+        } else {
+            let name_off = self.names.len() as u32;
+            self.names.extend_from_slice(name);
+            (name_off, name.len().min(SHARED as usize - 1) as u16)
+        };
         self.folded.push(0);
         self.owner_off.push(fold_off);
         self.owner_id.push(id);
-        (name_off, fold_off, fold_len)
+        (name_off, name_len, fold_off, fold_len)
     }
 
     pub fn is_dir(&self, id: u32) -> bool {
@@ -306,9 +331,24 @@ impl Index {
         }
     }
 
+    /// Appends the path relative to the entry's root ("Projects/omarchy-find");
+    /// nothing for a root itself. Recursive, so callers can reuse `out`
+    /// without a per-call chain.
+    pub fn rel_path(&self, id: u32, out: &mut Vec<u8>) {
+        if id == VROOT || self.is_root(id) {
+            return;
+        }
+        let parent = self.entries[id as usize].parent;
+        if parent != VROOT && !self.is_root(parent) {
+            self.rel_path(parent, out);
+            out.push(b'/');
+        }
+        out.extend_from_slice(self.name(id));
+    }
+
     pub fn add_child(&mut self, parent: u32, name: &[u8], kind: Kind) -> u32 {
         let id = self.entries.len() as u32;
-        let (name_off, fold_off, fold_len) = self.push_name(id, name);
+        let (name_off, name_len, fold_off, fold_len) = self.push_name(id, name);
         let ext = if kind == Kind::File { self.intern_ext(name) } else { 0 };
         self.ext.push(ext);
         let p = self.entries[parent as usize];
@@ -325,7 +365,7 @@ impl Index {
             next_sibling: NONE,
             name_off,
             fold_off,
-            name_len: name.len() as u16,
+            name_len,
             fold_len,
             kind,
             flags,
@@ -409,13 +449,13 @@ impl Index {
     /// their derived hidden flag and depth are refreshed.
     pub fn rename(&mut self, id: u32, new_parent: u32, new_name: &[u8]) {
         self.unlink(id);
-        let (name_off, fold_off, fold_len) = self.push_name(id, new_name);
+        let (name_off, name_len, fold_off, fold_len) = self.push_name(id, new_name);
         if self.entries[id as usize].kind == Kind::File {
             self.ext[id as usize] = self.intern_ext(new_name);
         }
         let e = &mut self.entries[id as usize];
         e.name_off = name_off;
-        e.name_len = new_name.len() as u16;
+        e.name_len = name_len;
         e.fold_off = fold_off;
         e.fold_len = fold_len;
         self.link(new_parent, id);
@@ -450,7 +490,7 @@ impl Index {
             entries: Vec::with_capacity(self.live + 1),
             names: Vec::with_capacity(self.names.len()),
             folded: Vec::with_capacity(self.folded.len()),
-            dir_stamp: HashMap::with_capacity(self.dir_stamp.len()),
+            dir_stamp: IdMap::with_capacity_and_hasher(self.dir_stamp.len(), Default::default()),
             exclude_patterns: self.exclude_patterns.clone(),
             live: 0,
             dead: 0,
@@ -461,7 +501,7 @@ impl Index {
             ext_names: vec![Vec::new()],
             ext_ids: HashMap::new(),
             kid_count: vec![0],
-            wide: HashMap::new(),
+            wide: IdMap::default(),
         };
         fresh.folded.push(0);
         fresh.entries.push(self.entries[0]);
@@ -511,6 +551,23 @@ impl Index {
         self.dir_stamp.shrink_to_fit();
     }
 
+    /// Makes room for `entries` more entries, `dirs` of them directories,
+    /// whose names add up to `name_bytes`, so a load of known size does not
+    /// grow the arrays an eighth at a time. Best effort: if a reservation
+    /// fails, make_room grows the arrays as usual.
+    pub fn reserve(&mut self, entries: usize, dirs: usize, name_bytes: usize, longest: usize) {
+        let _ = self.entries.try_reserve_exact(entries);
+        let _ = self.ext.try_reserve_exact(entries);
+        let _ = self.kid_count.try_reserve_exact(entries);
+        let _ = self.owner_off.try_reserve_exact(entries);
+        let _ = self.owner_id.try_reserve_exact(entries);
+        let _ = self.names.try_reserve_exact(name_bytes);
+        // Folded names usually keep their length; make_room also wants
+        // worst-case space for the name being added, plus each NUL.
+        let _ = self.folded.try_reserve_exact(name_bytes.saturating_add(entries).saturating_add(longest * 3 + 1));
+        let _ = self.dir_stamp.try_reserve(dirs);
+    }
+
     /// Grows the arrays by an eighth instead of doubling them, so the first
     /// change after a shrink() does not double the resident index.
     fn make_room(&mut self, name_len: usize) {
@@ -542,6 +599,33 @@ impl Index {
     /// Every live directory, roots included, the virtual node excluded.
     pub fn live_dirs(&self) -> impl Iterator<Item = u32> + '_ {
         (1..self.entries.len() as u32).filter(|&i| self.entries[i as usize].kind == Kind::Dir)
+    }
+}
+
+/// Map keyed by entry id. Ids are assigned by lince, never chosen by whoever
+/// names the files, so SipHash's flooding resistance buys nothing here while
+/// its cost shows on every insert when millions of entries are loaded.
+pub type IdMap<V> = HashMap<u32, V, BuildHasherDefault<IdHasher>>;
+
+#[derive(Default)]
+pub struct IdHasher(u64);
+
+impl Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(self.0 ^ b as u64);
+        }
+    }
+    fn write_u32(&mut self, n: u32) {
+        self.write_u64(n as u64);
+    }
+    fn write_u64(&mut self, n: u64) {
+        // Fibonacci hashing: distinct ids keep distinct low bits (the bucket)
+        // and the multiply spreads them into the high bits (the tag).
+        self.0 = n.wrapping_mul(0x9e37_79b9_7f4a_7c15);
     }
 }
 
@@ -762,6 +846,31 @@ pub(crate) mod tests {
         assert_eq!(idx.path(map[file as usize]), before);
         assert_eq!(idx.dead, 0);
         assert!(find(&idx, "Música").is_none());
+    }
+
+    #[test]
+    fn names_already_folded_are_stored_once() {
+        let (_dir, mut idx) = fixture();
+        let file = find(&idx, "a/b/file.txt").unwrap();
+        let musica = find(&idx, "Música").unwrap();
+        let names_before = idx.names.len();
+        assert_eq!(idx.name(file), b"file.txt");
+        assert_eq!(idx.name(musica), "Música".as_bytes());
+        // Only "Música", and the root's path if it has capitals, differ from
+        // their folded form.
+        let root = idx.roots[0].id;
+        let root_bytes = if idx.name(root) == idx.folded(root) { 0 } else { idx.name(root).len() };
+        assert_eq!(names_before, root_bytes + "Música".len());
+        idx.rename(file, idx.entries[file as usize].parent, b"Report.TXT");
+        assert_eq!(idx.name(file), b"Report.TXT");
+        assert_eq!(idx.folded(file), b"report.txt");
+        idx.rename(musica, idx.entries[musica as usize].parent, b"musica");
+        assert_eq!(idx.name(musica), b"musica");
+        assert_eq!(idx.names.len(), names_before + "Report.TXT".len());
+        let map = idx.compact();
+        assert_eq!(idx.name(map[file as usize]), b"Report.TXT");
+        assert_eq!(idx.name(map[musica as usize]), b"musica");
+        assert!(find(&idx, "a/b/Report.TXT").is_some());
     }
 
     #[test]
