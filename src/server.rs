@@ -172,7 +172,8 @@ pub fn serve(cfg: Config) -> Result<(), String> {
     let mut clients: Vec<Client> = Vec::new();
     let mut saved_generation = index.generation;
     let mut last_save = Instant::now();
-    let mut dirty_heap = false;
+    // Startup leaves the buffers of the load or crawl behind in the heap.
+    let mut dirty_heap = true;
 
     let save = |index: &Index| {
         if let Err(e) = persist::save(index, &cfg.snapshot) {
@@ -192,8 +193,9 @@ pub fn serve(cfg: Config) -> Result<(), String> {
             libc::pollfd { fd: stdin_fd, events: libc::POLLIN, revents: 0 },
         ];
         fds.extend(clients.iter().map(|c| libc::pollfd { fd: c.stream.as_raw_fd(), events: libc::POLLIN, revents: 0 }));
-        // After a burst of queries, wait a few seconds and hand freed query
-        // buffers back to the system instead of keeping the peak resident.
+        // After a burst of queries or any other heavy work, wait a few seconds
+        // and hand freed buffers back to the system instead of keeping the
+        // peak resident.
         let mut timeout = if dirty_heap { 5_000 } else { 60_000 };
         let polling = watcher.as_ref().is_some_and(|w| !w.fresh());
         if polling {
@@ -222,7 +224,7 @@ pub fn serve(cfg: Config) -> Result<(), String> {
             return Ok(());
         }
         if fds[2].revents != 0 {
-            apply_events(&mut index, &mut watcher);
+            dirty_heap |= apply_events(&mut index, &mut watcher);
         }
         if fds[0].revents != 0 {
             while let Ok((stream, _)) = listener.accept() {
@@ -294,16 +296,18 @@ pub fn serve(cfg: Config) -> Result<(), String> {
         }
         report_watches(&watcher, &mut was_fresh);
 
-        if index.dead > 10_000 && index.dead > index.live / 4 {
+        if index.wants_compact() {
             let map = index.compact();
             if let Some(w) = watcher.as_mut() {
                 w.remap(&map);
             }
+            dirty_heap = true;
         }
         if index.generation != saved_generation && last_save.elapsed() > Duration::from_secs(600) {
             save(&index);
             saved_generation = index.generation;
             last_save = Instant::now();
+            dirty_heap = true;
         }
     }
 }
@@ -327,8 +331,9 @@ fn report_watches(watcher: &Option<Watcher>, was_fresh: &mut bool) {
     }
 }
 
-fn apply_events(index: &mut Index, watcher: &mut Option<Watcher>) {
-    let Some(w) = watcher.as_mut() else { return };
+/// Applies pending events. True if an overflow forced a rescan.
+fn apply_events(index: &mut Index, watcher: &mut Option<Watcher>) -> bool {
+    let Some(w) = watcher.as_mut() else { return false };
     let applied = w.drain(index, threads());
     if applied.overflow {
         // Events were lost: reconcile against the disk, like a journal rescan.
@@ -337,6 +342,7 @@ fn apply_events(index: &mut Index, watcher: &mut Option<Watcher>) {
         w.commit();
         log(&format!("inotify overflow: {changed} dirs re-read in {} ms", t.elapsed().as_millis()));
     }
+    applied.overflow
 }
 
 fn handle_line(line: &[u8], newest: bool, index: &mut Index, watcher: &mut Option<Watcher>) -> String {
