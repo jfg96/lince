@@ -707,6 +707,8 @@ pub fn list_dir(index_root_excludes: &Override, dir: &Path) -> Vec<(Vec<u8>, Kin
 /// inotify watch first, so nothing created during the read is missed).
 pub trait DirHook: Sync {
     fn before_read(&self, id: u32, path: &Path);
+    /// Directories that left the index outside the event handlers.
+    fn removed(&self, _dirs: Vec<u32>) {}
 }
 
 pub struct NoHook;
