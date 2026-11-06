@@ -313,7 +313,8 @@ impl Index {
         }
         let mut path = Vec::new();
         for (i, &c) in chain.iter().rev().enumerate() {
-            if i > 0 {
+            // The root "/" already ends in the separator.
+            if i > 0 && path.last() != Some(&b'/') {
                 path.push(b'/');
             }
             path.extend_from_slice(self.name(c));
@@ -914,6 +915,14 @@ pub(crate) mod tests {
         assert_eq!(idx.name(map[file as usize]), b"Report.TXT");
         assert_eq!(idx.name(map[musica as usize]), b"musica");
         assert!(find(&idx, "a/b/Report.TXT").is_some());
+    }
+
+    #[test]
+    fn paths_below_the_filesystem_root_have_one_slash() {
+        let mut idx = Index::new(&[PathBuf::from("/")], &[]).unwrap();
+        let dir = idx.add_child(idx.roots[0].id, b"etc", Kind::Dir);
+        let file = idx.add_child(dir, b"fstab", Kind::File);
+        assert_eq!(idx.path(file).as_os_str(), "/etc/fstab");
     }
 
     #[test]
