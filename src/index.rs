@@ -481,6 +481,18 @@ impl Index {
         }
     }
 
+    /// Names in the blobs that no live entry uses: those of dead entries and
+    /// those left behind by renames, which searches still have to scan.
+    pub fn stale_names(&self) -> usize {
+        self.owner_off.len() - self.live
+    }
+
+    /// Whether enough of the index is stale to be worth rewriting.
+    pub fn wants_compact(&self) -> bool {
+        let stale = self.stale_names();
+        stale > 10_000 && stale > self.live / 4
+    }
+
     /// Rewrites the arrays without dead entries and leaked names. Returns the
     /// old→new id map (NONE for removed ids).
     pub fn compact(&mut self) -> Vec<u32> {
@@ -871,6 +883,29 @@ pub(crate) mod tests {
         assert_eq!(idx.name(map[file as usize]), b"Report.TXT");
         assert_eq!(idx.name(map[musica as usize]), b"musica");
         assert!(find(&idx, "a/b/Report.TXT").is_some());
+    }
+
+    #[test]
+    fn renames_alone_lead_to_compaction() {
+        let (_dir, mut idx) = fixture();
+        let file = find(&idx, "a/b/file.txt").unwrap();
+        let parent = idx.entries[file as usize].parent;
+        assert_eq!(idx.stale_names(), 0);
+        let mut renames = 0;
+        while !idx.wants_compact() {
+            renames += 1;
+            let name = if renames % 2 == 0 { "file.txt" } else { "other.txt" };
+            idx.rename(file, parent, name.as_bytes());
+        }
+        assert_eq!((renames, idx.dead), (10_001, 0), "renames leave no dead entries");
+        assert_eq!(idx.stale_names(), renames);
+        let before = idx.memory_bytes();
+        let path = idx.path(file);
+        let map = idx.compact();
+        assert_eq!(idx.stale_names(), 0);
+        assert!(!idx.wants_compact());
+        assert!(idx.memory_bytes() < before);
+        assert_eq!(idx.path(map[file as usize]), path);
     }
 
     #[test]

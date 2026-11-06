@@ -294,7 +294,7 @@ pub fn serve(cfg: Config) -> Result<(), String> {
         }
         report_watches(&watcher, &mut was_fresh);
 
-        if index.dead > 10_000 && index.dead > index.live / 4 {
+        if index.wants_compact() {
             let map = index.compact();
             if let Some(w) = watcher.as_mut() {
                 w.remap(&map);
