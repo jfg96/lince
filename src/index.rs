@@ -24,6 +24,7 @@ use std::sync::{Condvar, Mutex};
 use ignore::overrides::{Override, OverrideBuilder};
 
 use crate::fold::fold_into;
+use crate::mounts;
 
 /// Virtual parent of every indexed root.
 pub const VROOT: u32 = 0;
@@ -50,6 +51,9 @@ pub struct Root {
     pub path: PathBuf,
     pub id: u32,
     pub excludes: Override,
+    /// Pseudo file systems below the root, relative to it, skipped like
+    /// excludes but not part of what a snapshot was built with.
+    pub skipped: Vec<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -164,9 +168,12 @@ impl Index {
             depth: 0,
         });
         for path in paths {
-            let excludes = build_excludes(&path, patterns)?;
+            let skipped = mounts::pseudo_below(&path);
+            let mut all = patterns.to_vec();
+            all.extend(skipped.iter().map(|rel| mounts::anchored(rel)));
+            let excludes = build_excludes(&path, &all)?;
             let id = index.add_child(VROOT, path.as_os_str().as_bytes(), Kind::Dir);
-            index.roots.push(Root { path, id, excludes });
+            index.roots.push(Root { path, id, excludes, skipped });
         }
         Ok(index)
     }
@@ -487,6 +494,21 @@ impl Index {
         self.owner_off.len() - self.live
     }
 
+    /// Removes the skipped mounts from an index loaded from a snapshot taken
+    /// when they were indexed, or mounted somewhere else.
+    pub fn drop_skipped(&mut self) {
+        for r in 0..self.roots.len() {
+            for rel in std::mem::take(&mut self.roots[r].skipped) {
+                let start = self.roots[r].id;
+                let found = rel.iter().try_fold(start, |dir, part| self.child_by_name(dir, part.as_bytes()));
+                if let Some(id) = found {
+                    self.remove(id);
+                }
+                self.roots[r].skipped.push(rel);
+            }
+        }
+    }
+
     /// Whether enough of the index is stale to be worth rewriting.
     pub fn wants_compact(&self) -> bool {
         let stale = self.stale_names();
@@ -524,7 +546,7 @@ impl Index {
         for r in &self.roots {
             let id = fresh.add_child(VROOT, self.name(r.id), Kind::Dir);
             map[r.id as usize] = id;
-            fresh.roots.push(Root { path: r.path.clone(), id, excludes: r.excludes.clone() });
+            fresh.roots.push(Root { path: r.path.clone(), id, excludes: r.excludes.clone(), skipped: r.skipped.clone() });
             queue.push_back(r.id);
         }
         // Breadth-first keeps parents before children and siblings together.
@@ -892,6 +914,18 @@ pub(crate) mod tests {
         assert_eq!(idx.name(map[file as usize]), b"Report.TXT");
         assert_eq!(idx.name(map[musica as usize]), b"musica");
         assert!(find(&idx, "a/b/Report.TXT").is_some());
+    }
+
+    #[test]
+    fn drop_skipped_removes_a_subtree_a_snapshot_kept() {
+        let (_dir, mut idx) = fixture();
+        let live = idx.live;
+        idx.roots[0].skipped = vec![PathBuf::from("a/.hid"), PathBuf::from("not/there")];
+        idx.drop_skipped();
+        assert!(find(&idx, "a/.hid").is_none());
+        assert!(find(&idx, "a/b/file.txt").is_some());
+        assert_eq!(idx.live, live - 3, ".hid, c and secret.md");
+        assert_eq!(idx.roots[0].skipped.len(), 2, "skipped mounts survive for later compactions");
     }
 
     #[test]

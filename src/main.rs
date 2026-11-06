@@ -12,6 +12,7 @@
 mod config;
 mod fold;
 mod index;
+mod mounts;
 mod persist;
 mod query;
 mod server;

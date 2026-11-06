@@ -117,6 +117,7 @@ These operational cases use each engine's matching behavior and can return diffe
 ## Limits
 
 - Linux only (inotify, signalfd). It indexes names, not contents or metadata.
+- Pseudo file systems below a root (`/proc`, `/sys`, `/dev` and the like) are skipped; tmpfs is not. They are read from the mount table at startup, so one mounted later may be indexed until the next restart.
 - Watches cost kernel memory (up to about 1 KB each) and count against `fs.inotify.max_user_watches`. A home with 34k directories uses 34k watches. Directories past `max_watches`, or refused by the kernel, are polled by ctime in round-robin passes of at most 16k directories (tens of milliseconds each, about 2% of one core), every directory about every 10 seconds or more, and watched again once watches are freed. Meanwhile responses say `"fresh": false` and status reports `unwatched`.
 - A cold start right after boot has not been benchmarked yet. The snapshot plus ctime validation is there to keep it short.
 

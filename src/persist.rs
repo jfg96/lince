@@ -183,6 +183,7 @@ pub fn load(path: &Path, roots: &[PathBuf], patterns: &[String]) -> Result<Index
             id_at.push(u32::MAX);
         }
     }
+    index.drop_skipped();
     index.shrink();
     Ok(index)
 }
