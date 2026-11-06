@@ -598,14 +598,21 @@ impl Index {
     }
 
     pub fn memory_bytes(&self) -> usize {
+        // A hash table keeps one control byte per slot and at most 7/8 of
+        // its slots full.
+        fn table<K, V>(capacity: usize) -> usize {
+            capacity * (std::mem::size_of::<(K, V)>() + 1) * 8 / 7
+        }
         self.entries.capacity() * std::mem::size_of::<Entry>()
             + self.owner_off.capacity() * 8
             + self.ext.capacity() * 2
             + self.names.capacity()
             + self.folded.capacity()
-            + self.dir_stamp.capacity() * 16
+            + table::<u32, i64>(self.dir_stamp.capacity())
             + self.kid_count.capacity() * 4
-            + self.wide.values().map(|m| m.capacity() * 13).sum::<usize>()
+            + self.wide.values().map(|m| table::<u64, u32>(m.capacity())).sum::<usize>()
+            + table::<Vec<u8>, u16>(self.ext_ids.capacity())
+            + self.ext_names.iter().map(|e| std::mem::size_of::<Vec<u8>>() + 2 * e.len()).sum::<usize>()
     }
 
     /// Every live directory, roots included, the virtual node excluded.
