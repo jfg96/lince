@@ -39,6 +39,8 @@ pub struct Watcher {
     added: Mutex<Vec<(i32, u32)>>,
     /// Directories refused a watch by crawl workers, until `commit`.
     refused: Mutex<Vec<u32>>,
+    /// Directories a rescan removed from the index, until `commit`.
+    gone: Mutex<Vec<u32>>,
     /// Directories without a watch (over the budget, or inotify said ENOSPC).
     /// Changes in them are only seen by `retry`, so the index cannot promise
     /// freshness until this is empty again.
@@ -76,6 +78,10 @@ impl DirHook for Watcher {
         }
         added.push((wd, id));
     }
+
+    fn removed(&self, dirs: Vec<u32>) {
+        self.gone.lock().unwrap().extend(dirs);
+    }
 }
 
 impl Watcher {
@@ -92,6 +98,7 @@ impl Watcher {
             dir_wd: HashMap::new(),
             added: Mutex::new(Vec::new()),
             refused: Mutex::new(Vec::new()),
+            gone: Mutex::new(Vec::new()),
             unwatched: HashSet::new(),
             retry_queue: VecDeque::new(),
             budget: budget.unwrap_or_else(default_budget),
@@ -152,6 +159,8 @@ impl Watcher {
                 self.retry_queue.push_back(id);
             }
         }
+        let gone = std::mem::take(self.gone.get_mut().unwrap());
+        self.forget(&gone);
     }
 
     /// Watches every directory already in the index (after loading a snapshot).
@@ -170,6 +179,8 @@ impl Watcher {
             if new != crate::index::NONE {
                 self.wd_dir.insert(wd, new);
                 self.dir_wd.insert(new, wd);
+            } else {
+                unsafe { libc::inotify_rm_watch(self.fd, wd) };
             }
         }
         let remap = |id: u32| Some(map[id as usize]).filter(|&id| id != crate::index::NONE);
@@ -445,6 +456,25 @@ mod tests {
         w.drain(&mut index, 1);
         assert!(lookup(&index, "a/later.txt").is_some());
         assert!(lookup(&index, "b/fresh").is_some());
+    }
+
+    #[test]
+    fn a_rescan_releases_watches_of_directories_it_removes() {
+        let dir = tempdir::Dir::new();
+        let tree = dir.0.join("tree");
+        std::fs::create_dir_all(tree.join("a/sub")).unwrap();
+        let mut w = Watcher::new(None).unwrap();
+        let mut index = build(&[tree.clone()], &[], 1, &w).unwrap();
+        w.commit();
+        assert_eq!(w.watch_count(), 3);
+
+        // Out of the tree, so inotify would keep watching it; a lost event
+        // leaves the rescan as the only one to notice.
+        std::fs::rename(tree.join("a"), dir.0.join("moved")).unwrap();
+        persist::refresh(&mut index, 1, &w);
+        w.commit();
+        assert!(lookup(&index, "a").is_none());
+        assert_eq!(w.watch_count(), 1);
     }
 
     #[test]

@@ -739,7 +739,9 @@ impl<'a> Scan<'a> {
             .iter()
             .map(|r| {
                 let mut p = index.folded(r.id).to_vec();
-                p.push(b'/');
+                if p.last() != Some(&b'/') {
+                    p.push(b'/');
+                }
                 p
             })
             .collect();

@@ -24,6 +24,7 @@ use std::sync::{Condvar, Mutex};
 use ignore::overrides::{Override, OverrideBuilder};
 
 use crate::fold::fold_into;
+use crate::mounts;
 
 /// Virtual parent of every indexed root.
 pub const VROOT: u32 = 0;
@@ -50,6 +51,9 @@ pub struct Root {
     pub path: PathBuf,
     pub id: u32,
     pub excludes: Override,
+    /// Pseudo file systems below the root, relative to it, skipped like
+    /// excludes but not part of what a snapshot was built with.
+    pub skipped: Vec<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -164,9 +168,12 @@ impl Index {
             depth: 0,
         });
         for path in paths {
-            let excludes = build_excludes(&path, patterns)?;
+            let skipped = mounts::pseudo_below(&path);
+            let mut all = patterns.to_vec();
+            all.extend(skipped.iter().map(|rel| mounts::anchored(rel)));
+            let excludes = build_excludes(&path, &all)?;
             let id = index.add_child(VROOT, path.as_os_str().as_bytes(), Kind::Dir);
-            index.roots.push(Root { path, id, excludes });
+            index.roots.push(Root { path, id, excludes, skipped });
         }
         Ok(index)
     }
@@ -306,7 +313,8 @@ impl Index {
         }
         let mut path = Vec::new();
         for (i, &c) in chain.iter().rev().enumerate() {
-            if i > 0 {
+            // The root "/" already ends in the separator.
+            if i > 0 && path.last() != Some(&b'/') {
                 path.push(b'/');
             }
             path.extend_from_slice(self.name(c));
@@ -487,6 +495,21 @@ impl Index {
         self.owner_off.len() - self.live
     }
 
+    /// Removes the skipped mounts from an index loaded from a snapshot taken
+    /// when they were indexed, or mounted somewhere else.
+    pub fn drop_skipped(&mut self) {
+        for r in 0..self.roots.len() {
+            for rel in std::mem::take(&mut self.roots[r].skipped) {
+                let start = self.roots[r].id;
+                let found = rel.iter().try_fold(start, |dir, part| self.child_by_name(dir, part.as_bytes()));
+                if let Some(id) = found {
+                    self.remove(id);
+                }
+                self.roots[r].skipped.push(rel);
+            }
+        }
+    }
+
     /// Whether enough of the index is stale to be worth rewriting.
     pub fn wants_compact(&self) -> bool {
         let stale = self.stale_names();
@@ -524,7 +547,7 @@ impl Index {
         for r in &self.roots {
             let id = fresh.add_child(VROOT, self.name(r.id), Kind::Dir);
             map[r.id as usize] = id;
-            fresh.roots.push(Root { path: r.path.clone(), id, excludes: r.excludes.clone() });
+            fresh.roots.push(Root { path: r.path.clone(), id, excludes: r.excludes.clone(), skipped: r.skipped.clone() });
             queue.push_back(r.id);
         }
         // Breadth-first keeps parents before children and siblings together.
@@ -598,14 +621,21 @@ impl Index {
     }
 
     pub fn memory_bytes(&self) -> usize {
+        // A hash table keeps one control byte per slot and at most 7/8 of
+        // its slots full.
+        fn table<K, V>(capacity: usize) -> usize {
+            capacity * (std::mem::size_of::<(K, V)>() + 1) * 8 / 7
+        }
         self.entries.capacity() * std::mem::size_of::<Entry>()
             + self.owner_off.capacity() * 8
             + self.ext.capacity() * 2
             + self.names.capacity()
             + self.folded.capacity()
-            + self.dir_stamp.capacity() * 16
+            + table::<u32, i64>(self.dir_stamp.capacity())
             + self.kid_count.capacity() * 4
-            + self.wide.values().map(|m| m.capacity() * 13).sum::<usize>()
+            + self.wide.values().map(|m| table::<u64, u32>(m.capacity())).sum::<usize>()
+            + table::<Vec<u8>, u16>(self.ext_ids.capacity())
+            + self.ext_names.iter().map(|e| std::mem::size_of::<Vec<u8>>() + 2 * e.len()).sum::<usize>()
     }
 
     /// Every live directory, roots included, the virtual node excluded.
@@ -707,6 +737,8 @@ pub fn list_dir(index_root_excludes: &Override, dir: &Path) -> Vec<(Vec<u8>, Kin
 /// inotify watch first, so nothing created during the read is missed).
 pub trait DirHook: Sync {
     fn before_read(&self, id: u32, path: &Path);
+    /// Directories that left the index outside the event handlers.
+    fn removed(&self, _dirs: Vec<u32>) {}
 }
 
 pub struct NoHook;
@@ -883,6 +915,26 @@ pub(crate) mod tests {
         assert_eq!(idx.name(map[file as usize]), b"Report.TXT");
         assert_eq!(idx.name(map[musica as usize]), b"musica");
         assert!(find(&idx, "a/b/Report.TXT").is_some());
+    }
+
+    #[test]
+    fn paths_below_the_filesystem_root_have_one_slash() {
+        let mut idx = Index::new(&[PathBuf::from("/")], &[]).unwrap();
+        let dir = idx.add_child(idx.roots[0].id, b"etc", Kind::Dir);
+        let file = idx.add_child(dir, b"fstab", Kind::File);
+        assert_eq!(idx.path(file).as_os_str(), "/etc/fstab");
+    }
+
+    #[test]
+    fn drop_skipped_removes_a_subtree_a_snapshot_kept() {
+        let (_dir, mut idx) = fixture();
+        let live = idx.live;
+        idx.roots[0].skipped = vec![PathBuf::from("a/.hid"), PathBuf::from("not/there")];
+        idx.drop_skipped();
+        assert!(find(&idx, "a/.hid").is_none());
+        assert!(find(&idx, "a/b/file.txt").is_some());
+        assert_eq!(idx.live, live - 3, ".hid, c and secret.md");
+        assert_eq!(idx.roots[0].skipped.len(), 2, "skipped mounts survive for later compactions");
     }
 
     #[test]

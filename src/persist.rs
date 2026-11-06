@@ -183,6 +183,7 @@ pub fn load(path: &Path, roots: &[PathBuf], patterns: &[String]) -> Result<Index
             id_at.push(u32::MAX);
         }
     }
+    index.drop_skipped();
     index.shrink();
     Ok(index)
 }
@@ -257,11 +258,11 @@ pub fn refresh_dirs(index: &mut Index, order: &[u32], threads: usize, hook: &dyn
                 // A missing root (an unmounted disk) is emptied, not dropped,
                 // so it comes back on a later refresh.
                 for c in index.children(dir).collect::<Vec<_>>() {
-                    index.remove(c);
+                    hook.removed(index.remove(c));
                 }
                 index.dir_stamp.insert(dir, 0);
             } else {
-                index.remove(dir);
+                hook.removed(index.remove(dir));
             }
             continue;
         };
@@ -279,7 +280,7 @@ pub fn refresh_dirs(index: &mut Index, order: &[u32], threads: usize, hook: &dyn
             .filter(|&c| !present.contains(&(index.name(c), index.entries[c as usize].kind)))
             .collect();
         for c in stale {
-            index.remove(c);
+            hook.removed(index.remove(c));
         }
         for (name, kind) in &listing {
             if index.child_by_name(dir, name).is_some() {
