@@ -84,26 +84,30 @@ pub struct Index {
     pub dead: usize,
     /// Bumped on every mutation so caches can tell they are stale.
     pub generation: u64,
-    /// (offset in `folded`, entry id) for every folded name ever appended,
-    /// sorted by offset because the blob only grows. Maps a hit found by
+    /// Offset in `folded` of every folded name ever appended, one slot per
+    /// name, ascending because the blob only grows. Maps a hit found by
     /// scanning the whole blob back to its entry; names left behind by a
     /// rename no longer match their entry's fold_off and are skipped.
     pub owner_off: Vec<u32>,
-    pub owner_id: Vec<u32>,
-    /// Interned lowercase extension of every entry (0 = none), so category
-    /// filters test a table instead of comparing suffixes per file.
+    /// (slot, entry id) of the names appended by renames, ascending. Every
+    /// other slot belongs to the entries in id order, so the owner of a slot
+    /// is computed (`slot_owner`) instead of stored per name.
+    renamed: Vec<(u32, u32)>,
+    /// Interned lowercase extension of every file (0 = none), so category
+    /// filters test a table instead of comparing suffixes per file. A
+    /// directory has no extension: its slot counts its children instead
+    /// (saturating), which is how `link` knows when it has become wide.
     pub ext: Vec<u16>,
     pub ext_names: Vec<Vec<u8>>,
     ext_ids: HashMap<Vec<u8>, u16>,
-    /// Child count per entry, and a name-hash → child map for directories
-    /// with more than WIDE children (names are verified against the blob;
-    /// a colliding name falls back to the sibling scan), so events in huge directories do not turn
-    /// every lookup into a scan of the sibling list.
-    kid_count: Vec<u32>,
+    /// A name-hash → child map for directories with more than WIDE children
+    /// (names are verified against the blob; a colliding name falls back to
+    /// the sibling scan), so events in huge directories do not turn every
+    /// lookup into a scan of the sibling list.
     wide: IdMap<HashMap<u64, u32>>,
 }
 
-const WIDE: u32 = 64;
+const WIDE: u16 = 64;
 
 pub fn build_excludes(root: &Path, patterns: &[String]) -> Result<Override, String> {
     // fd turns every --exclude into a negated override glob rooted at the
@@ -147,11 +151,10 @@ impl Index {
             dead: 0,
             generation: 0,
             owner_off: Vec::new(),
-            owner_id: Vec::new(),
+            renamed: Vec::new(),
             ext: vec![0],
             ext_names: vec![Vec::new()],
             ext_ids: HashMap::new(),
-            kid_count: vec![0],
             wide: IdMap::default(),
         };
         index.folded.push(0);
@@ -228,9 +231,23 @@ impl Index {
         let end = (start + step + 1).min(offsets.len());
         let i = start + offsets[start..end].partition_point(|&o| o as usize <= off).checked_sub(1)?;
         *cursor = i;
-        let id = self.owner_id[i];
+        let id = self.slot_owner(i);
         let e = &self.entries[id as usize];
         (e.fold_off == self.owner_off[i] && e.kind != Kind::Dead).then_some(id)
+    }
+
+    /// Entry a slot of `owner_off` was appended for. Entry ids start at 1 and
+    /// each new entry appends one name, so only renames shift the count.
+    fn slot_owner(&self, slot: usize) -> u32 {
+        match self.renamed.first() {
+            Some(&(first, _)) if first as usize <= slot => {
+                match self.renamed.binary_search_by_key(&(slot as u32), |r| r.0) {
+                    Ok(k) => self.renamed[k].1,
+                    Err(before) => (slot - before) as u32 + 1,
+                }
+            }
+            _ => slot as u32 + 1,
+        }
     }
 
     fn intern_ext(&mut self, name: &[u8]) -> u16 {
@@ -264,7 +281,7 @@ impl Index {
     /// Appends a name to the blobs; returns (name_off, name_len, fold_off,
     /// fold_len). Most names in a home are already lowercase ASCII: those
     /// are stored once, in the folded blob, and marked SHARED.
-    fn push_name(&mut self, id: u32, name: &[u8]) -> (u32, u16, u32, u16) {
+    fn push_name(&mut self, name: &[u8]) -> (u32, u16, u32, u16) {
         self.make_room(name.len());
         let fold_off = self.folded.len() as u32;
         fold_into(name, &mut self.folded);
@@ -279,7 +296,6 @@ impl Index {
         };
         self.folded.push(0);
         self.owner_off.push(fold_off);
-        self.owner_id.push(id);
         (name_off, name_len, fold_off, fold_len)
     }
 
@@ -356,7 +372,7 @@ impl Index {
 
     pub fn add_child(&mut self, parent: u32, name: &[u8], kind: Kind) -> u32 {
         let id = self.entries.len() as u32;
-        let (name_off, name_len, fold_off, fold_len) = self.push_name(id, name);
+        let (name_off, name_len, fold_off, fold_len) = self.push_name(name);
         let ext = if kind == Kind::File { self.intern_ext(name) } else { 0 };
         self.ext.push(ext);
         let p = self.entries[parent as usize];
@@ -379,7 +395,6 @@ impl Index {
             flags,
             depth,
         });
-        self.kid_count.push(0);
         self.link(parent, id);
         self.live += 1;
         self.generation += 1;
@@ -390,11 +405,12 @@ impl Index {
         self.entries[id as usize].parent = parent;
         self.entries[id as usize].next_sibling = self.entries[parent as usize].first_child;
         self.entries[parent as usize].first_child = id;
-        self.kid_count[parent as usize] += 1;
+        let kids = self.ext[parent as usize].saturating_add(1);
+        self.ext[parent as usize] = kids;
         if self.wide.contains_key(&parent) {
             let h = name_hash(self.name(id));
             self.wide.get_mut(&parent).unwrap().entry(h).or_insert(id);
-        } else if self.kid_count[parent as usize] > WIDE {
+        } else if kids > WIDE {
             let mut map = HashMap::with_capacity(WIDE as usize * 2);
             for c in self.children(parent) {
                 map.entry(name_hash(self.name(c))).or_insert(c);
@@ -405,7 +421,9 @@ impl Index {
 
     fn unlink(&mut self, id: u32) {
         let parent = self.entries[id as usize].parent;
-        self.kid_count[parent as usize] -= 1;
+        // Past saturation the count drifts, but only a directory that is not
+        // wide yet reads it, and one that large already is.
+        self.ext[parent as usize] = self.ext[parent as usize].saturating_sub(1);
         if self.wide.contains_key(&parent) {
             let h = name_hash(self.name(id));
             let map = self.wide.get_mut(&parent).unwrap();
@@ -457,7 +475,8 @@ impl Index {
     /// their derived hidden flag and depth are refreshed.
     pub fn rename(&mut self, id: u32, new_parent: u32, new_name: &[u8]) {
         self.unlink(id);
-        let (name_off, name_len, fold_off, fold_len) = self.push_name(id, new_name);
+        let (name_off, name_len, fold_off, fold_len) = self.push_name(new_name);
+        self.renamed.push((self.owner_off.len() as u32 - 1, id));
         if self.entries[id as usize].kind == Kind::File {
             self.ext[id as usize] = self.intern_ext(new_name);
         }
@@ -531,11 +550,10 @@ impl Index {
             dead: 0,
             generation: self.generation + 1,
             owner_off: Vec::with_capacity(self.live + 1),
-            owner_id: Vec::with_capacity(self.live + 1),
+            renamed: Vec::new(),
             ext: vec![0],
             ext_names: vec![Vec::new()],
             ext_ids: HashMap::new(),
-            kid_count: vec![0],
             wide: IdMap::default(),
         };
         fresh.folded.push(0);
@@ -580,9 +598,8 @@ impl Index {
         self.names.shrink_to_fit();
         self.folded.shrink_to_fit();
         self.owner_off.shrink_to_fit();
-        self.owner_id.shrink_to_fit();
+        self.renamed.shrink_to_fit();
         self.ext.shrink_to_fit();
-        self.kid_count.shrink_to_fit();
         self.dir_stamp.shrink_to_fit();
     }
 
@@ -593,9 +610,7 @@ impl Index {
     pub fn reserve(&mut self, entries: usize, dirs: usize, name_bytes: usize, longest: usize) {
         let _ = self.entries.try_reserve_exact(entries);
         let _ = self.ext.try_reserve_exact(entries);
-        let _ = self.kid_count.try_reserve_exact(entries);
         let _ = self.owner_off.try_reserve_exact(entries);
-        let _ = self.owner_id.try_reserve_exact(entries);
         let _ = self.names.try_reserve_exact(name_bytes);
         // Folded names usually keep their length; make_room also wants
         // worst-case space for the name being added, plus each NUL.
@@ -613,9 +628,7 @@ impl Index {
         }
         grow(&mut self.entries, 1);
         grow(&mut self.ext, 1);
-        grow(&mut self.kid_count, 1);
         grow(&mut self.owner_off, 1);
-        grow(&mut self.owner_id, 1);
         grow(&mut self.names, name_len);
         grow(&mut self.folded, name_len * 3 + 1);
     }
@@ -627,12 +640,12 @@ impl Index {
             capacity * (std::mem::size_of::<(K, V)>() + 1) * 8 / 7
         }
         self.entries.capacity() * std::mem::size_of::<Entry>()
-            + self.owner_off.capacity() * 8
+            + self.owner_off.capacity() * 4
+            + self.renamed.capacity() * 8
             + self.ext.capacity() * 2
             + self.names.capacity()
             + self.folded.capacity()
             + table::<u32, i64>(self.dir_stamp.capacity())
-            + self.kid_count.capacity() * 4
             + self.wide.values().map(|m| table::<u64, u32>(m.capacity())).sum::<usize>()
             + table::<Vec<u8>, u16>(self.ext_ids.capacity())
             + self.ext_names.iter().map(|e| std::mem::size_of::<Vec<u8>>() + 2 * e.len()).sum::<usize>()
@@ -964,18 +977,32 @@ pub(crate) mod tests {
     fn blob_owner_cursor_handles_gaps_and_stale_names() {
         let (_dir, mut idx) = fixture();
         let file = find(&idx, "a/b/file.txt").unwrap();
-        idx.rename(file, idx.entries[file as usize].parent, b"renamed.txt");
+        let parent = idx.entries[file as usize].parent;
+        idx.rename(file, parent, b"renamed.txt");
         idx.remove(find(&idx, "Música").unwrap());
+        // Owners are computed from the order names were appended in: mix new
+        // entries with renames, of old entries and of the new ones.
+        for i in 0..40u32 {
+            let added = idx.add_child(parent, format!("added-{i}").as_bytes(), Kind::File);
+            if i % 3 == 0 {
+                idx.rename(added, parent, format!("again-{i}").as_bytes());
+            }
+            if i % 7 == 0 {
+                idx.rename(file, parent, format!("renamed-{i}.txt").as_bytes());
+            }
+        }
         fn check(idx: &Index) {
             let mut cursor = 0;
             // Compare every offset (including terminators) with an independent
             // linear lookup; then exercise jumps and backwards/restarted scans.
             let offsets: Vec<usize> = (0..idx.folded_blob().len()).collect();
             for off in offsets.iter().copied().chain(offsets.iter().rev().step_by(7).copied()) {
+                // The live entry whose current name starts at that slot.
                 let want = idx.owner_off.iter().rposition(|&o| o as usize <= off).and_then(|i| {
-                    let id = idx.owner_id[i];
-                    let e = &idx.entries[id as usize];
-                    (e.fold_off == idx.owner_off[i] && e.kind != Kind::Dead).then_some(id)
+                    (1..idx.entries.len() as u32).find(|&id| {
+                        let e = &idx.entries[id as usize];
+                        e.fold_off == idx.owner_off[i] && e.kind != Kind::Dead
+                    })
                 });
                 assert_eq!(idx.owner_at(off, &mut cursor), want, "offset {off}");
             }
