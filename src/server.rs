@@ -380,7 +380,7 @@ pub fn client(socket: &Path) -> Result<(), String> {
         stream.write_all(line.as_bytes()).and_then(|_| stream.write_all(b"\n")).map_err(|e| e.to_string())?;
         let mut resp = String::new();
         reader.read_line(&mut resp).map_err(|e| e.to_string())?;
-        print!("{resp}");
+        crate::emit(&resp)?;
     }
     Ok(())
 }

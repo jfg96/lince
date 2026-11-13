@@ -68,6 +68,17 @@ pub fn threads() -> usize {
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8))
 }
 
+/// Writes to stdout. A reader that stops early (`lince search x | head`)
+/// closes the pipe: that ends the output, it is not a failure.
+pub fn emit(text: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    match out.write_all(text.as_bytes()).and_then(|_| out.flush()) {
+        Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => Err(format!("stdout: {e}")),
+        _ => Ok(()),
+    }
+}
+
 fn rss_kib() -> u64 {
     std::fs::read_to_string("/proc/self/status")
         .ok()
@@ -126,24 +137,27 @@ fn cmd_search(args: &Args) -> Result<(), String> {
         return Err(err.as_str().unwrap_or("error").to_string());
     }
     if args.flag("--json") {
-        println!("{resp}");
-        return Ok(());
+        return emit(&format!("{resp}\n"));
     }
+    // The daemon keeps the best `limit` of each kind, in no particular order.
+    let mut paths: Vec<String> = ["dirs", "files"]
+        .iter()
+        .flat_map(|key| resp[*key].as_array().into_iter().flatten())
+        .filter_map(|p| p.as_str().map(str::to_owned))
+        .collect();
+    query::rank(&terms.join(" "), &mut paths);
+    paths.truncate(limit);
     let mut out = String::new();
-    for key in ["dirs", "files"] {
-        for p in resp[key].as_array().into_iter().flatten().filter_map(|p| p.as_str()).take(limit) {
-            out.push_str(p);
-            out.push('\n');
-        }
+    for p in &paths {
+        out.push_str(p);
+        out.push('\n');
     }
-    print!("{out}");
-    Ok(())
+    emit(&out)
 }
 
 fn cmd_status(args: &Args) -> Result<(), String> {
     let resp = server::ask(&args.socket()?, &serde_json::json!({ "op": "status" }))?;
-    println!("{}", serde_json::to_string_pretty(&resp).unwrap());
-    Ok(())
+    emit(&format!("{}\n", serde_json::to_string_pretty(&resp).unwrap()))
 }
 
 fn cmd_oneshot(args: &Args) -> Result<(), String> {
@@ -173,8 +187,7 @@ fn cmd_oneshot(args: &Args) -> Result<(), String> {
         out.push_str(path);
         out.push('\n');
     }
-    print!("{out}");
-    Ok(())
+    emit(&out)
 }
 
 fn cmd_stats(args: &Args) -> Result<(), String> {

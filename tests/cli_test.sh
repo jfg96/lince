@@ -87,6 +87,20 @@ status=$("$bin" status --socket "$sock")
 check contains "$status" '"fresh": true'
 check contains "$status" '"v": 1'
 check contains "$("$bin" search --socket "$sock" --json fresh)" '"v":1'
+
+# search prints the best matches first, --limit of them in all.
+mapfile -t best < <("$bin" search --socket "$sock" --hidden fresh)
+check test "${best[0]}" == "$home/Documents/fresh-note.md"
+check test "$("$bin" search --socket "$sock" --limit 1 fresh | wc -l)" == 1
+check test "$("$bin" search --socket "$sock" --limit 3 fresh | wc -l)" == 3
+
+# A reader that stops early ends the output without an error.
+mkdir "$home/pipe"
+touch "$home/pipe"/pipe-{0001..1500}-padding-padding-padding-padding-padding.md
+closed=0
+"$bin" search --socket "$sock" --limit 2000 pipe 2>"$work/pipe.err" | head -n 1 >/dev/null || closed=${PIPESTATUS[0]}
+check test "$closed" == 0
+check test ! -s "$work/pipe.err"
 check contains "$(printf '%s\n' '{"op":"search","query":"x","roots":["/nowhere"]}' | "$bin" query --socket "$sock")" "root not indexed"
 
 echo "$passed CLI checks passed"

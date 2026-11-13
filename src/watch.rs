@@ -323,9 +323,13 @@ impl Watcher {
         // A move whose destination is outside the tree (or not yet read)
         // becomes a removal; if the MOVED_TO shows up later it is an add,
         // which rescans the subtree, so the end state is still right.
+        // The removal runs after every later event, and one of them may have
+        // put something else at that name (moved to the trash, then created
+        // again): what is on disk now is added back, and watched.
         for (_, (dir, name, _)) in moved_from {
             if index.entries[dir as usize].kind == Kind::Dir {
                 self.remove(index, dir, &name);
+                let _ = self.add(index, dir, &name, threads);
             }
         }
         for (dir, name) in missing {
@@ -475,6 +479,38 @@ mod tests {
         w.commit();
         assert!(lookup(&index, "a").is_none());
         assert_eq!(w.watch_count(), 1);
+    }
+
+    #[test]
+    fn keeps_what_replaces_an_entry_moved_out_of_the_tree() {
+        let dir = tempdir::Dir::new();
+        let tree = dir.0.join("tree");
+        std::fs::create_dir_all(tree.join("d")).unwrap();
+        std::fs::write(tree.join("a.txt"), b"").unwrap();
+        std::fs::write(tree.join("d/old.txt"), b"").unwrap();
+        std::fs::write(tree.join("left.txt"), b"").unwrap();
+        let mut w = Watcher::new(None).unwrap();
+        let mut index = build(&[tree.clone()], &[], 1, &w).unwrap();
+        w.commit();
+
+        // All queued before one drain: each MOVED_FROM has no MOVED_TO, and
+        // the name is taken again before the removal is applied.
+        std::fs::rename(tree.join("a.txt"), dir.0.join("a.txt")).unwrap();
+        std::fs::write(tree.join("a.txt"), b"").unwrap();
+        std::fs::rename(tree.join("d"), dir.0.join("d")).unwrap();
+        std::fs::create_dir(tree.join("d")).unwrap();
+        std::fs::write(tree.join("d/new.txt"), b"").unwrap();
+        std::fs::rename(tree.join("left.txt"), dir.0.join("left.txt")).unwrap();
+        w.drain(&mut index, 1);
+
+        assert!(lookup(&index, "a.txt").is_some());
+        assert!(lookup(&index, "d/new.txt").is_some());
+        assert!(lookup(&index, "d/old.txt").is_none(), "the directory that left took its contents");
+        assert!(lookup(&index, "left.txt").is_none());
+        assert_eq!(w.watch_count(), 2, "the old directory's watch is released");
+        std::fs::write(tree.join("d/later.txt"), b"").unwrap();
+        w.drain(&mut index, 1);
+        assert!(lookup(&index, "d/later.txt").is_some(), "the new directory is watched");
     }
 
     #[test]

@@ -403,7 +403,9 @@ impl<'a> Scan<'a> {
     fn new(index: &'a Index, q: &'a Compiled, req: &'a Request) -> Result<Scan<'a>, String> {
         let mut allowed_roots = vec![req.roots.is_empty(); index.roots.len()];
         for want in &req.roots {
-            let want = Path::new(want.trim_end_matches('/'));
+            // Without its trailing slashes, the file system root is still "/".
+            let trimmed = want.trim_end_matches('/');
+            let want = Path::new(if trimmed.is_empty() && want.starts_with('/') { "/" } else { trimmed });
             let i = index
                 .roots
                 .iter()
@@ -852,6 +854,31 @@ fn score_item(name: &[u8], path: &[u8], terms: &[Term]) -> u32 {
     total
 }
 
+/// Sorts the paths of a response best first, as PROTOCOL.md ranks them, for
+/// a client that only has the paths. It does not know the roots, so hidden
+/// and depth are taken from the whole path: the order differs from the
+/// daemon's only between roots, or below a root that is itself hidden.
+pub fn rank(query: &str, paths: &mut [String]) {
+    let terms: Vec<Term> = query
+        .split_whitespace()
+        .map(|t| {
+            let folded = fold(t);
+            Term { finder: Finder::new(&folded).into_owned(), slash: false, folded }
+        })
+        .collect();
+    paths.sort_by_cached_key(|path| {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        let hidden = path.split('/').any(|part| part.starts_with('.'));
+        let utf16: Vec<u16> = path.encode_utf16().collect();
+        if terms.is_empty() {
+            (0, hidden, path.matches('/').count() as u32, fold(name), utf16)
+        } else {
+            let score = score_item(&fold(name), &fold(path), &terms);
+            (score, hidden, utf16_len(name.as_bytes()), Vec::new(), utf16)
+        }
+    });
+}
+
 fn mtime_ms(path: &Path) -> Option<f64> {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::symlink_metadata(path).ok()?;
@@ -994,6 +1021,44 @@ mod tests {
                 assert_eq!(got, want, "query {query:?}, cap {max}");
             }
         }
+    }
+
+    #[test]
+    fn the_file_system_root_can_be_named_as_a_root() {
+        let mut index = Index::new(&[std::path::PathBuf::from("/")], &[]).unwrap();
+        let etc = index.add_child(index.roots[0].id, b"etc", Kind::Dir);
+        index.add_child(etc, b"fstab", Kind::File);
+        for root in ["/", "//"] {
+            let req: Request = serde_json::from_value(serde_json::json!({ "query": "fstab", "roots": [root] })).unwrap();
+            assert_eq!(search(&index, &req).unwrap().files, ["/etc/fstab"], "root {root:?}");
+        }
+        let req: Request = serde_json::from_value(serde_json::json!({ "query": "fstab", "roots": [""] })).unwrap();
+        assert!(search(&index, &req).unwrap_err().contains("root not indexed"));
+    }
+
+    #[test]
+    fn rank_orders_paths_as_the_daemon_keeps_them() {
+        let dir = tempdir::Dir::new();
+        // Scores 0 to 4, then the same prefix score with a longer name.
+        let ranked = ["x/report", "x/report-old.txt", "x/old-report.txt", "x/myreport.txt", "reports/notes.txt"];
+        let index = files(&dir, &ranked.map(str::as_bytes));
+        let req: Request = serde_json::from_value(serde_json::json!({ "query": "report", "kinds": ["f"] })).unwrap();
+        let mut paths = search(&index, &req).unwrap().files;
+        paths.reverse();
+        rank("report", &mut paths);
+        let root = index.roots[0].path.to_str().unwrap().to_owned() + "/";
+        let got: Vec<&str> = paths.iter().map(|p| p.strip_prefix(&root).unwrap()).collect();
+        assert_eq!(got, ranked);
+        // Every prefix of the ranking is what the daemon keeps at that cap.
+        for max in 1..=ranked.len() {
+            let mut want: Vec<&str> = got[..max].to_vec();
+            want.sort();
+            assert_eq!(kept(&index, "report", max), want, "max_results {max}");
+        }
+
+        let mut browse = vec!["/r/b/deep".to_string(), "/r/Zeta".into(), "/r/.hid".into(), "/r/alpha".into()];
+        rank("", &mut browse);
+        assert_eq!(browse, ["/r/alpha", "/r/Zeta", "/r/b/deep", "/r/.hid"]);
     }
 
     #[test]
