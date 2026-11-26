@@ -10,7 +10,7 @@ $ lince search hypr config
 ```
 
 - **Fast:** about 1.5 ms per search on a 366k-entry home, and 7 ms on a million entries (details below).
-- **Fresh:** every directory is watched. Changes made before a search are always in its results, and a lost-event overflow is repaired automatically.
+- **Fresh:** when the daemon reports a fresh index, searches reflect changes made before the request. A lost-event overflow is repaired automatically.
 - **Accent- and case-insensitive:** `cancion` finds `Canción`, `españa` finds `espana`, and names stored in NFD match too.
 - **Name, path and fuzzy passes**, plus filters for kind, extension, hidden files, roots, scopes, depth and gitignore-style excludes.
 - **Ranked:** when there are more matches than the client asked for, it keeps the best ones, not whichever came first.
@@ -27,7 +27,7 @@ tar xzf lince-v0.1.6-x86_64-linux.tar.gz
 install -Dm755 lince-v0.1.6-x86_64-linux/lince ~/.local/bin/lince
 ```
 
-Or build it from source (Rust 1.85+):
+Or build it from source (Rust 1.88+):
 
 ```sh
 cargo install --locked --git https://github.com/jfg96/lince
@@ -119,6 +119,7 @@ These operational cases use each engine's matching behavior and can return diffe
 - Linux only (inotify, signalfd). It indexes names, not contents or metadata.
 - Pseudo file systems below a root (`/proc`, `/sys`, `/dev` and the like) are skipped; tmpfs is not. They are read from the mount table at startup, so one mounted later may be indexed until the next restart.
 - Watches cost kernel memory (up to about 1 KB each) and count against `fs.inotify.max_user_watches`. A home with 34k directories uses 34k watches. Directories past `max_watches`, or refused by the kernel, are polled by ctime in round-robin passes of at most 16k directories (tens of milliseconds each, about 2% of one core), every directory about every 10 seconds or more, and watched again once watches are freed. Meanwhile responses say `"fresh": false` and status reports `unwatched`.
+- If an indexed root disappears, its results are removed and responses report `"fresh": false` while it is missing. When a directory reappears at that path, lince indexes it again.
 - A cold start right after boot has not been benchmarked yet. The snapshot plus ctime validation is there to keep it short.
 
 ## Development

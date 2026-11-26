@@ -22,7 +22,8 @@ use std::path::{Path, PathBuf};
 use crate::index::{crawl, ctime_ns, list_dir, settled, DirHook, IdMap, Index, Kind};
 
 const MAGIC: &[u8; 4] = b"LNC1";
-const VERSION: u32 = 1;
+// Older caches may contain stale paths or exclusions from a directory move.
+const VERSION: u32 = 2;
 
 fn put_varint(out: &mut Vec<u8>, mut v: u64) {
     loop {
@@ -120,8 +121,11 @@ pub fn save(index: &Index, path: &Path) -> Result<(), String> {
 pub fn load(path: &Path, roots: &[PathBuf], patterns: &[String]) -> Result<Index, String> {
     let buf = std::fs::read(path).map_err(|e| e.to_string())?;
     let mut r = Reader { buf: &buf, pos: 0 };
-    if r.bytes(4)? != MAGIC || u32::from_le_bytes(r.bytes(4)?.try_into().unwrap()) != VERSION {
+    if r.bytes(4)? != MAGIC {
         return Err("not a LNC1 snapshot".into());
+    }
+    if u32::from_le_bytes(r.bytes(4)?.try_into().unwrap()) != VERSION {
+        return Err("outdated snapshot format".into());
     }
     let nroots = r.varint()? as usize;
     let mut stored_roots = Vec::with_capacity(nroots);

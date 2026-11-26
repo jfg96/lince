@@ -18,3 +18,9 @@ jobs:
       - run: cargo build --release --locked
       - run: bash tests/cli_test.sh target/release/lince
       - run: python3 tests/stress_updates.py target/release/lince 2000
+  minimum-rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install 1.88.0 --profile minimal
+      - run: cargo +1.88.0 check --locked --all-targets
