@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex};
 
@@ -50,6 +51,7 @@ const SHARED: u16 = 0x8000;
 pub struct Root {
     pub path: PathBuf,
     pub id: u32,
+    pub identity: Option<(u64, u64)>,
     pub excludes: Override,
     /// Pseudo file systems below the root, relative to it, skipped like
     /// excludes but not part of what a snapshot was built with.
@@ -176,7 +178,8 @@ impl Index {
             all.extend(skipped.iter().map(|rel| mounts::anchored(rel)));
             let excludes = build_excludes(&path, &all)?;
             let id = index.add_child(VROOT, path.as_os_str().as_bytes(), Kind::Dir);
-            index.roots.push(Root { path, id, excludes, skipped });
+            let identity = dir_identity(&path);
+            index.roots.push(Root { path, id, identity, excludes, skipped });
         }
         Ok(index)
     }
@@ -508,6 +511,24 @@ impl Index {
         }
     }
 
+    /// Whether an indexed directory can gain or lose descendants due to
+    /// path-based exclusions under this location.
+    pub fn has_excludes_below(&self, path: &Path) -> bool {
+        let Some(root) = self.root_for_path(path).map(|r| &self.roots[r]) else { return false };
+        root.skipped.iter().any(|rel| root.path.join(rel).starts_with(path))
+            || self.exclude_patterns.iter().any(|pattern| {
+                let glob = pattern.trim_end();
+                let glob = glob.strip_suffix('/').unwrap_or(glob);
+                if glob.is_empty() || !glob.contains('/') {
+                    return false;
+                }
+                // An anchored literal can only affect subtrees above it.
+                // For globs, conservatively recheck the moved subtree.
+                glob.contains(['*', '?', '[', '{', '\\'])
+                    || root.path.join(glob.trim_start_matches('/')).starts_with(path)
+            })
+    }
+
     /// Names in the blobs that no live entry uses: those of dead entries and
     /// those left behind by renames, which searches still have to scan.
     pub fn stale_names(&self) -> usize {
@@ -565,7 +586,13 @@ impl Index {
         for r in &self.roots {
             let id = fresh.add_child(VROOT, self.name(r.id), Kind::Dir);
             map[r.id as usize] = id;
-            fresh.roots.push(Root { path: r.path.clone(), id, excludes: r.excludes.clone(), skipped: r.skipped.clone() });
+            fresh.roots.push(Root {
+                path: r.path.clone(),
+                id,
+                identity: r.identity,
+                excludes: r.excludes.clone(),
+                skipped: r.skipped.clone(),
+            });
             queue.push_back(r.id);
         }
         // Breadth-first keeps parents before children and siblings together.
@@ -707,9 +734,13 @@ impl Iterator for ChildIter<'_> {
 }
 
 pub fn ctime_ns(path: &Path) -> Option<i64> {
-    use std::os::unix::fs::MetadataExt;
     let meta = std::fs::symlink_metadata(path).ok()?;
-    Some(meta.ctime() * 1_000_000_000 + meta.ctime_nsec())
+    meta.is_dir().then(|| meta.ctime() * 1_000_000_000 + meta.ctime_nsec())
+}
+
+pub fn dir_identity(path: &Path) -> Option<(u64, u64)> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    meta.is_dir().then(|| (meta.dev(), meta.ino()))
 }
 
 /// The stamp to record for a directory listed now with ctime `stamp`. The

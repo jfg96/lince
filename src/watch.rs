@@ -21,7 +21,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Mutex;
 
-use crate::index::{crawl, DirHook, Index, Kind};
+use crate::index::{crawl, dir_identity, DirHook, Index, Kind, VROOT};
 use crate::persist;
 
 const MASK: u32 = libc::IN_CREATE
@@ -41,7 +41,7 @@ pub struct Watcher {
     refused: Mutex<Vec<u32>>,
     /// Directories a rescan removed from the index, until `commit`.
     gone: Mutex<Vec<u32>>,
-    /// Directories without a watch (over the budget, or inotify said ENOSPC).
+    /// Directories without a watch (over the budget, or refused by inotify).
     /// Changes in them are only seen by `retry`, so the index cannot promise
     /// freshness until this is empty again.
     unwatched: HashSet<u32>,
@@ -70,10 +70,8 @@ impl DirHook for Watcher {
         }
         let wd = unsafe { libc::inotify_add_watch(self.fd, c.as_ptr(), MASK) };
         if wd < 0 {
-            if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOSPC) {
-                drop(added);
-                self.refused.lock().unwrap().push(id);
-            }
+            drop(added);
+            self.refused.lock().unwrap().push(id);
             return;
         }
         added.push((wd, id));
@@ -125,6 +123,7 @@ impl Watcher {
     /// unwatched are polled this way. Returns how many were checked.
     pub fn retry(&mut self, index: &mut Index, threads: usize, max: usize) -> usize {
         self.commit();
+        self.refresh_roots(index, threads);
         let mut dirs = Vec::new();
         while dirs.len() < max {
             let Some(d) = self.retry_queue.pop_front() else { break };
@@ -199,6 +198,35 @@ impl Watcher {
         }
     }
 
+    /// Watches follow inodes. Check the configured paths as well, since a
+    /// root can disappear or be replaced without an event on a watched parent.
+    fn refresh_roots(&mut self, index: &mut Index, threads: usize) {
+        let mut changed = Vec::new();
+        for root in &mut index.roots {
+            let identity = dir_identity(&root.path);
+            if identity != root.identity {
+                root.identity = identity;
+                changed.push(root.id);
+            }
+        }
+        if changed.is_empty() {
+            return;
+        }
+        for &id in &changed {
+            for child in index.children(id).collect::<Vec<_>>() {
+                self.forget(&index.remove(child));
+            }
+            self.forget(&[id]);
+            index.dir_stamp.remove(&id);
+        }
+        for &id in &changed {
+            self.before_read(id, &index.path(id));
+        }
+        self.commit();
+        persist::refresh_dirs(index, &changed, threads, self);
+        self.commit();
+    }
+
     /// `threads` is 1 for IN_CREATE (a new directory is nearly always empty)
     /// and the full pool when a directory moves in from outside the tree.
     /// Adds what is now on disk at `name` in `dir`. False when nothing is
@@ -240,8 +268,17 @@ impl Watcher {
     }
 
     /// False like `add` when the destination had to be added and was gone.
-    fn rename(&mut self, index: &mut Index, from: (u32, Vec<u8>), to: (u32, &[u8]), is_dir: bool, threads: usize) -> bool {
-        let Some(id) = index.child_by_name(from.0, &from.1) else {
+    fn rename(
+        &mut self,
+        index: &mut Index,
+        from: (u32, Vec<u8>),
+        to: (u32, &[u8]),
+        is_dir: bool,
+        threads: usize,
+        moved_dirs: &mut HashSet<u32>,
+    ) -> bool {
+        let source = if index.is_dir(from.0) { index.child_by_name(from.0, &from.1) } else { None };
+        let Some(id) = source else {
             return self.add(index, to.0, to.1, threads);
         };
         if let Some(existing) = index.child_by_name(to.0, to.1) {
@@ -256,15 +293,38 @@ impl Watcher {
             self.forget(&gone);
             return true;
         }
+        if is_dir {
+            // If a previously moved ancestor still needs reconciliation,
+            // this directory must carry that work to its own destination.
+            let mut ancestor = from.0;
+            while !moved_dirs.is_empty() && ancestor != VROOT && !moved_dirs.contains(&ancestor) {
+                ancestor = index.entries[ancestor as usize].parent;
+            }
+            if moved_dirs.contains(&ancestor)
+                || index.has_excludes_below(&path)
+                || index.has_excludes_below(&index.path(id))
+            {
+                moved_dirs.insert(id);
+            }
+        }
         index.rename(id, to.0, to.1);
         true
     }
 
     /// Reads and applies every queued event. Returns what happened.
     pub fn drain(&mut self, index: &mut Index, threads: usize) -> Applied {
+        self.refresh_roots(index, threads);
         let mut applied = Applied::default();
+        // A reconciliation can add watches while the file system is active.
+        // Drain those events too before answering a query.
+        while self.drain_batch(index, threads, &mut applied) {}
+        applied
+    }
+
+    fn drain_batch(&mut self, index: &mut Index, threads: usize, applied: &mut Applied) -> bool {
         let mut buf = vec![0u8; 64 * 1024];
-        let mut moved_from: HashMap<u32, (u32, Vec<u8>, bool)> = HashMap::new();
+        let mut moved_from: HashMap<u32, (u32, Vec<u8>)> = HashMap::new();
+        let mut moved_dirs = HashSet::new();
         // Adds that found nothing on disk. If an ancestor was renamed after
         // the entry appeared, the rename's events were queued before the
         // failed stat, so this drain applies them; retrying at the end looks
@@ -291,6 +351,9 @@ impl Watcher {
                 if ev.mask & libc::IN_IGNORED != 0 {
                     if let Some(id) = self.wd_dir.remove(&ev.wd) {
                         self.dir_wd.remove(&id);
+                        if self.unwatched.insert(id) {
+                            self.retry_queue.push_back(id);
+                        }
                     }
                     continue;
                 }
@@ -306,11 +369,11 @@ impl Watcher {
                 } else if ev.mask & libc::IN_DELETE != 0 {
                     self.remove(index, dir, name);
                 } else if ev.mask & libc::IN_MOVED_FROM != 0 {
-                    moved_from.insert(ev.cookie, (dir, name.to_vec(), is_dir));
+                    moved_from.insert(ev.cookie, (dir, name.to_vec()));
                 } else if ev.mask & libc::IN_MOVED_TO != 0 {
                     let found = match moved_from.remove(&ev.cookie) {
-                        Some((from_dir, from_name, _)) => {
-                            self.rename(index, (from_dir, from_name), (dir, name), is_dir, threads)
+                        Some(from) => {
+                            self.rename(index, from, (dir, name), is_dir, threads, &mut moved_dirs)
                         }
                         None => self.add(index, dir, name, threads),
                     };
@@ -326,7 +389,7 @@ impl Watcher {
         // The removal runs after every later event, and one of them may have
         // put something else at that name (moved to the trash, then created
         // again): what is on disk now is added back, and watched.
-        for (_, (dir, name, _)) in moved_from {
+        for (_, (dir, name)) in moved_from {
             if index.entries[dir as usize].kind == Kind::Dir {
                 self.remove(index, dir, &name);
                 let _ = self.add(index, dir, &name, threads);
@@ -338,7 +401,25 @@ impl Watcher {
                 let _ = self.add(index, dir, &name, threads);
             }
         }
-        applied
+        if moved_dirs.is_empty() {
+            return false;
+        }
+        // Read the final locations once the whole sequence of moves has
+        // been applied. Even unchanged ctimes need new exclusion checks.
+        let mut stack: Vec<u32> = moved_dirs.into_iter().collect();
+        let mut seen = HashSet::new();
+        let mut dirs = Vec::new();
+        while let Some(dir) = stack.pop() {
+            if index.is_dir(dir) && seen.insert(dir) {
+                index.dir_stamp.remove(&dir);
+                dirs.push(dir);
+                stack.extend(index.children(dir).filter(|&child| index.is_dir(child)));
+            }
+        }
+        dirs.sort_unstable_by_key(|&dir| (index.entries[dir as usize].depth, dir));
+        persist::refresh_dirs(index, &dirs, threads, self);
+        self.commit();
+        true
     }
 }
 
@@ -364,6 +445,84 @@ mod tests {
 
     fn lookup(index: &Index, rel: &str) -> Option<u32> {
         rel.split('/').try_fold(index.roots[0].id, |dir, part| index.child_by_name(dir, part.as_bytes()))
+    }
+
+    #[test]
+    fn a_replaced_root_is_indexed_and_watched_again() {
+        let dir = tempdir::Dir::new();
+        let parent = dir.0.join("parent");
+        let root = parent.join("root");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/old.txt"), b"").unwrap();
+        let mut w = Watcher::new(None).unwrap();
+        let mut index = build(std::slice::from_ref(&root), &[], 2, &w).unwrap();
+        w.commit();
+
+        // Even moving an unwatched ancestor invalidates the root's path.
+        std::fs::rename(&parent, dir.0.join("moved")).unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/new.txt"), b"").unwrap();
+        w.drain(&mut index, 2);
+        assert!(lookup(&index, "sub/old.txt").is_none());
+        assert!(lookup(&index, "sub/new.txt").is_some());
+        assert!(w.fresh());
+        assert_eq!(w.watch_count(), 2);
+
+        std::fs::rename(&root, dir.0.join("gone")).unwrap();
+        w.drain(&mut index, 2);
+        assert!(lookup(&index, "sub").is_none());
+        assert!(!w.fresh());
+        assert_eq!(w.watch_count(), 0);
+
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("back.txt"), b"").unwrap();
+        w.retry(&mut index, 2, 1);
+        assert!(lookup(&index, "back.txt").is_some());
+        assert!(w.fresh());
+        std::fs::write(root.join("later.txt"), b"").unwrap();
+        w.drain(&mut index, 2);
+        assert!(lookup(&index, "later.txt").is_some());
+    }
+
+    #[test]
+    fn moving_a_subtree_applies_its_new_path_exclusions() {
+        let dir = tempdir::Dir::new();
+        let root = &dir.0;
+        std::fs::create_dir_all(root.join("job/private")).unwrap();
+        std::fs::create_dir(root.join("inbox")).unwrap();
+        std::fs::write(root.join("job/private/notes.txt"), b"").unwrap();
+        std::fs::write(root.join("job/secret.log"), b"").unwrap();
+        let excludes = ["/inbox/job/private/".into(), "inbox/job/secret.log".into()];
+        let mut w = Watcher::new(None).unwrap();
+        let mut index = build(std::slice::from_ref(root), &excludes, 2, &w).unwrap();
+        w.commit();
+
+        std::fs::rename(root.join("job"), root.join("inbox/job")).unwrap();
+        w.drain(&mut index, 2);
+        assert!(lookup(&index, "inbox/job").is_some());
+        assert!(lookup(&index, "inbox/job/private").is_none());
+        assert!(lookup(&index, "inbox/job/secret.log").is_none());
+        assert_eq!(w.watch_count(), 3);
+
+        std::fs::rename(root.join("inbox/job"), root.join("job")).unwrap();
+        w.drain(&mut index, 2);
+        assert!(lookup(&index, "job/private/notes.txt").is_some());
+        assert!(lookup(&index, "job/secret.log").is_some());
+        assert_eq!(w.watch_count(), 4);
+        std::fs::write(root.join("job/private/later.txt"), b"").unwrap();
+        w.drain(&mut index, 2);
+        assert!(lookup(&index, "job/private/later.txt").is_some());
+        assert!(w.fresh());
+
+        // A child can leave its moved parent before reconciliation. Its
+        // missing entries still need to be looked up at the final location.
+        std::fs::rename(root.join("job"), root.join("inbox/job")).unwrap();
+        w.drain(&mut index, 2);
+        std::fs::rename(root.join("inbox"), root.join("archive")).unwrap();
+        std::fs::rename(root.join("archive/job"), root.join("job")).unwrap();
+        w.drain(&mut index, 2);
+        assert!(lookup(&index, "job/private/later.txt").is_some());
+        assert!(lookup(&index, "job/secret.log").is_some());
     }
 
     #[test]
