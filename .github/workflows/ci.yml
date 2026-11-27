@@ -17,6 +17,7 @@ jobs:
       - run: cargo test --release --locked
       - run: cargo build --release --locked
       - run: bash tests/cli_test.sh target/release/lince
+      - run: python3 tests/socket_backpressure.py target/release/lince
       - run: python3 tests/stress_updates.py target/release/lince 2000
   minimum-rust:
     runs-on: ubuntu-latest

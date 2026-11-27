@@ -77,6 +77,8 @@ pub struct Index {
     pub entries: Vec<Entry>,
     names: Vec<u8>,
     folded: Vec<u8>,
+    /// Skip checking candidate paths when every indexed name is UTF-8.
+    pub has_non_utf8_names: bool,
     /// ctime of each directory when it was last read. A directory's ctime
     /// changes whenever an entry is created, removed or renamed in it, which
     /// makes it a cheap way to validate a persisted index.
@@ -147,6 +149,7 @@ impl Index {
             entries: Vec::new(),
             names: Vec::new(),
             folded: Vec::new(),
+            has_non_utf8_names: false,
             dir_stamp: IdMap::default(),
             exclude_patterns: patterns.to_vec(),
             live: 0,
@@ -287,7 +290,7 @@ impl Index {
     fn push_name(&mut self, name: &[u8]) -> (u32, u16, u32, u16) {
         self.make_room(name.len());
         let fold_off = self.folded.len() as u32;
-        fold_into(name, &mut self.folded);
+        self.has_non_utf8_names |= !fold_into(name, &mut self.folded);
         let fold_len = (self.folded.len() as u32 - fold_off).min(u16::MAX as u32) as u16;
         self.folded.truncate((fold_off + fold_len as u32) as usize);
         let (name_off, name_len) = if name.len() < SHARED as usize && self.folded[fold_off as usize..] == *name {
@@ -308,6 +311,16 @@ impl Index {
 
     pub fn children(&self, dir: u32) -> ChildIter<'_> {
         ChildIter { index: self, next: self.entries[dir as usize].first_child }
+    }
+
+    pub fn path_is_utf8(&self, mut id: u32) -> bool {
+        while id != VROOT {
+            if std::str::from_utf8(self.name(id)).is_err() {
+                return false;
+            }
+            id = self.entries[id as usize].parent;
+        }
+        true
     }
 
     pub fn child_by_name(&self, dir: u32, name: &[u8]) -> Option<u32> {
@@ -565,6 +578,7 @@ impl Index {
             entries: Vec::with_capacity(self.live + 1),
             names: Vec::with_capacity(self.names.len()),
             folded: Vec::with_capacity(self.folded.len()),
+            has_non_utf8_names: false,
             dir_stamp: IdMap::with_capacity_and_hasher(self.dir_stamp.len(), Default::default()),
             exclude_patterns: self.exclude_patterns.clone(),
             live: 0,

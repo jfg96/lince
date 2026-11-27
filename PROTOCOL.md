@@ -1,6 +1,6 @@
 # lince protocol, version 1
 
-Clients talk to `lince serve` over a Unix stream socket (default `$XDG_RUNTIME_DIR/lince/lince.sock`, or `$TMPDIR/lince-$UID/lince.sock` when `XDG_RUNTIME_DIR` is unset). Each request is a single line of JSON, and each one gets a single line of JSON back, in order. A client can keep its connection open for as long as it likes.
+Clients talk to `lince serve` over a Unix stream socket (default `$XDG_RUNTIME_DIR/lince/lince.sock`, or `$TMPDIR/lince-$UID/lince.sock` when `XDG_RUNTIME_DIR` is unset). Each request is a single line of JSON, and each one gets a single line of JSON back, in order. A client can keep its connection open between requests. The daemon closes the connection if a pending reply makes no write progress for one second.
 
 Every response carries `"v": 1`. Within a version, fields are only ever added. A client should ignore fields it does not know, and treat a different `v` as incompatible.
 
@@ -32,7 +32,7 @@ Response:
  "generation":313871,"fresh":true}
 ```
 
-- `dirs` and `files` are absolute paths, at most `max_results` of each, in no particular order. Sort them on the client. Paths that are not valid UTF-8 cannot be sent as JSON strings and are left out, though `matched_*` still counts them.
+- `dirs` and `files` are absolute paths, at most `max_results` of each, in no particular order. Sort them on the client. Paths that are not valid UTF-8 count towards `matched_*` and do not take up a slot in the returned results.
 - `matched_*` counts every match, including any that were cut by `max_results`.
 - `mtimes` maps a path to milliseconds since the epoch.
 - `fresh` is `false` when changes may be missing (the daemon runs without a watcher, or some directories have no watch). Directories without a watch are polled, so their changes show up within seconds rather than at once. A client that needs certainty should then walk the disk itself.

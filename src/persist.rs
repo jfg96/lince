@@ -15,15 +15,17 @@
 //! loaded snapshot is validated instead: every directory is stat'ed and only
 //! those whose ctime differs are re-read.
 
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::index::{crawl, ctime_ns, list_dir, settled, DirHook, IdMap, Index, Kind};
 
 const MAGIC: &[u8; 4] = b"LNC1";
 // Older caches may contain stale paths or exclusions from a directory move.
 const VERSION: u32 = 2;
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 fn put_varint(out: &mut Vec<u8>, mut v: u64) {
     loop {
@@ -107,14 +109,29 @@ pub fn save(index: &Index, path: &Path) -> Result<(), String> {
             prev = name;
         }
     }
-    // Write-then-rename so a crash never leaves a torn snapshot.
-    let tmp = path.with_extension("tmp");
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    // Each writer gets an exclusive temporary file beside the snapshot, so
+    // concurrent saves can only publish complete snapshots.
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let (tmp, file) = loop {
+        let seq = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let tmp = parent.join(format!(".lince-snapshot-{}-{seq}.tmp", std::process::id()));
+        if path.file_name() == tmp.file_name() {
+            continue;
+        }
+        match std::fs::File::create_new(&tmp) {
+            Ok(file) => break (tmp, file),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.to_string()),
+        }
+    };
+    let result = (&file).write_all(&out);
+    drop(file);
+    let result = result.and_then(|()| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    let mut file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
-    file.write_all(&out).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+    result.map_err(|e| e.to_string())
 }
 
 /// Loads a snapshot built for exactly these roots and excludes.
@@ -306,6 +323,36 @@ pub fn refresh_dirs(index: &mut Index, order: &[u32], threads: usize, hook: &dyn
 mod tests {
     use super::*;
     use crate::index::{build, NoHook};
+
+    #[test]
+    fn concurrent_saves_publish_complete_snapshots() {
+        use crate::index::tests::tempdir;
+        use std::sync::Barrier;
+
+        let dir = tempdir::Dir::new();
+        let root = dir.0.join("root");
+        std::fs::create_dir(&root).unwrap();
+        let roots = [root];
+        let mut index = Index::new(&roots, &[]).unwrap();
+        for i in 0..10_000 {
+            index.add_child(index.roots[0].id, format!("entry-{i}").as_bytes(), Kind::File);
+        }
+        let path = dir.0.join("shared.lnc");
+        let old_temp = path.with_extension("tmp");
+        std::fs::write(&old_temp, b"another file").unwrap();
+        let barrier = Barrier::new(4);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    save(&index, &path).unwrap();
+                });
+            }
+        });
+        assert_eq!(load(&path, &roots, &[]).unwrap().live, index.live);
+        assert_eq!(std::fs::read(&old_temp).unwrap(), b"another file");
+        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 3);
+    }
 
     #[test]
     fn roundtrip_and_refresh() {

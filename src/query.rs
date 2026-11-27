@@ -680,9 +680,12 @@ impl<'a> Scan<'a> {
         phases[1] += t.elapsed().as_micros() as u64;
         let t = std::time::Instant::now();
         if found.len() > max {
+            if self.index.has_non_utf8_names {
+                found.retain(|&id| self.index.path_is_utf8(id));
+            }
             if self.req.select.as_deref() == Some("first") {
                 found.truncate(max);
-            } else {
+            } else if found.len() > max {
                 self.keep_best(&mut found, max);
             }
         }
@@ -1064,11 +1067,16 @@ mod tests {
     #[test]
     fn non_utf8_paths_are_left_out() {
         let dir = tempdir::Dir::new();
-        let index = files(&dir, &[b"report-\xff", b"report-ok"]);
-        let req: Request = serde_json::from_value(serde_json::json!({ "query": "report", "kinds": ["f"] })).unwrap();
-        let resp = search(&index, &req).unwrap();
-        assert_eq!(resp.files.len(), 1);
-        assert!(resp.files[0].ends_with("/report-ok"));
-        assert_eq!(resp.matched_files, 2);
+        let index = files(&dir, &[b"report-\xff", b"bad-\xff/report", b"report-ok"]);
+        for select in ["best", "first"] {
+            for max_results in [1, 3] {
+                let req: Request = serde_json::from_value(serde_json::json!({
+                    "query": "report", "kinds": ["f"], "select": select, "max_results": max_results
+                })).unwrap();
+                let resp = search(&index, &req).unwrap();
+                assert_eq!(resp.files, [dir.0.join("report-ok").to_str().unwrap()]);
+                assert_eq!(resp.matched_files, 3);
+            }
+        }
     }
 }
