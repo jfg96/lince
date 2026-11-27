@@ -7,7 +7,7 @@
 //! several requests (fast typing), only the newest is answered; the others
 //! get {"v":1,"id":N,"superseded":true}.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -19,8 +19,7 @@ use crate::query::{self, Request};
 use crate::watch::Watcher;
 use crate::{persist, threads};
 
-/// A client that leaves a response unread this long is dropped, so it cannot
-/// stall the loop that serves everyone else.
+/// Drop a client whose pending response makes no write progress for this long.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Requests are a few hundred bytes; a client sending this much without a
 /// newline is not speaking the protocol.
@@ -35,6 +34,53 @@ const POLL_CHUNK: usize = 16_384;
 struct Client {
     stream: UnixStream,
     buf: Vec<u8>,
+    output: Option<PendingResponse>,
+    read_eof: bool,
+}
+
+struct PendingResponse {
+    bytes: String,
+    written: usize,
+    deadline: Instant,
+}
+
+impl Client {
+    fn read_requests(&mut self) -> io::Result<()> {
+        let mut chunk = [0u8; 16384];
+        loop {
+            match self.stream.read(&mut chunk) {
+                Ok(0) => {
+                    self.read_eof = true;
+                    return Ok(());
+                }
+                Ok(n) if self.buf.len() + n > MAX_PENDING => {
+                    return Err(io::Error::new(ErrorKind::InvalidData, "too much pending input"));
+                }
+                Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(()),
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn write_response(&mut self) -> io::Result<()> {
+        let Some(output) = &mut self.output else { return Ok(()) };
+        match self.stream.write(&output.bytes.as_bytes()[output.written..]) {
+            Ok(0) => Err(ErrorKind::WriteZero.into()),
+            Ok(n) => {
+                output.written += n;
+                if output.written == output.bytes.len() {
+                    self.output = None;
+                } else {
+                    output.deadline = Instant::now() + WRITE_TIMEOUT;
+                }
+                Ok(())
+            }
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 fn log(msg: &str) {
@@ -175,9 +221,11 @@ pub fn serve(cfg: Config) -> Result<(), String> {
     // Startup leaves the buffers of the load or crawl behind in the heap.
     let mut dirty_heap = true;
 
-    let save = |index: &Index| {
-        if let Err(e) = persist::save(index, &cfg.snapshot) {
+    let save = |index: &Index| match persist::save(index, &cfg.snapshot) {
+        Ok(()) => true,
+        Err(e) => {
             log(&format!("snapshot save failed: {e}"));
+            false
         }
     };
 
@@ -192,7 +240,6 @@ pub fn serve(cfg: Config) -> Result<(), String> {
             libc::pollfd { fd: watcher.as_ref().map_or(-1, |w| w.fd), events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: stdin_fd, events: libc::POLLIN, revents: 0 },
         ];
-        fds.extend(clients.iter().map(|c| libc::pollfd { fd: c.stream.as_raw_fd(), events: libc::POLLIN, revents: 0 }));
         // After a burst of queries or any other heavy work, wait a few seconds
         // and hand freed buffers back to the system instead of keeping the
         // peak resident.
@@ -201,14 +248,19 @@ pub fn serve(cfg: Config) -> Result<(), String> {
         if polling {
             timeout = timeout.min(next_retry.saturating_duration_since(Instant::now()).as_millis() as i32);
         }
+        let now = Instant::now();
+        fds.extend(clients.iter().map(|client| {
+            let events = if let Some(output) = &client.output {
+                let remaining = output.deadline.saturating_duration_since(now);
+                let ms = remaining.as_millis() as i32 + i32::from(!remaining.is_zero());
+                timeout = timeout.min(ms);
+                libc::POLLOUT
+            } else {
+                libc::POLLIN
+            };
+            libc::pollfd { fd: client.stream.as_raw_fd(), events, revents: 0 }
+        }));
         let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) };
-        if rc == 0 && dirty_heap {
-            #[cfg(target_env = "gnu")]
-            unsafe {
-                libc::malloc_trim(0);
-            }
-            dirty_heap = false;
-        }
         if rc < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
             return Err(format!("poll: {}", std::io::Error::last_os_error()));
         }
@@ -228,60 +280,68 @@ pub fn serve(cfg: Config) -> Result<(), String> {
         }
         if fds[0].revents != 0 {
             while let Ok((stream, _)) = listener.accept() {
-                let _ = stream.set_nonblocking(true);
-                let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
-                clients.push(Client { stream, buf: Vec::new() });
+                if stream.set_nonblocking(true).is_ok() {
+                    clients.push(Client { stream, buf: Vec::new(), output: None, read_eof: false });
+                }
             }
         }
 
         let mut closed = Vec::new();
         for (i, pfd) in fds[4..].iter().enumerate() {
-            if pfd.revents == 0 {
+            let client = &mut clients[i];
+            if pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                dirty_heap |= client.output.is_some();
+                closed.push(i);
                 continue;
             }
-            let client = &mut clients[i];
-            let mut chunk = [0u8; 16384];
-            loop {
-                match client.stream.read(&mut chunk) {
-                    Ok(0) => {
-                        closed.push(i);
-                        break;
+            if pfd.revents == 0 {
+                if client.output.as_ref().is_some_and(|out| out.deadline <= Instant::now()) {
+                    dirty_heap = true;
+                    closed.push(i);
+                }
+                continue;
+            }
+            // Read the next batch once this client has room for another
+            // response. Other clients keep progressing while it drains.
+            if client.output.is_none() {
+                if client.read_requests().is_err() {
+                    closed.push(i);
+                    continue;
+                }
+                if let Some(last_nl) = client.buf.iter().rposition(|&b| b == b'\n') {
+                    let pending: Vec<u8> = client.buf.drain(..=last_nl).collect();
+                    let mut lines = pending.split(|&b| b == b'\n').filter(|line| !line.is_empty()).peekable();
+                    let mut bytes = String::new();
+                    while let Some(line) = lines.next() {
+                        bytes.push_str(&handle_line(line, lines.peek().is_none(), &mut index, &mut watcher));
+                        bytes.push('\n');
                     }
-                    Ok(n) if client.buf.len() + n > MAX_PENDING => {
-                        closed.push(i);
-                        client.buf.clear();
-                        break;
-                    }
-                    Ok(n) => client.buf.extend_from_slice(&chunk[..n]),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => {
-                        closed.push(i);
-                        break;
+                    if !bytes.is_empty() {
+                        client.output = Some(PendingResponse {
+                            bytes,
+                            written: 0,
+                            deadline: Instant::now() + WRITE_TIMEOUT,
+                        });
                     }
                 }
             }
-            let Some(last_nl) = client.buf.iter().rposition(|&b| b == b'\n') else { continue };
-            let pending: Vec<u8> = client.buf.drain(..=last_nl).collect();
-            let lines: Vec<&[u8]> = pending.split(|&b| b == b'\n').filter(|l| !l.is_empty()).collect();
-            let mut out = String::new();
-            dirty_heap = true;
-            for (n, line) in lines.iter().enumerate() {
-                let newest = n + 1 == lines.len();
-                out.push_str(&handle_line(line, newest, &mut index, &mut watcher));
-                out.push('\n');
-            }
-            // Blocking up to WRITE_TIMEOUT; a timeout leaves half a response
-            // behind, so the client is dropped rather than retried.
-            let _ = client.stream.set_nonblocking(false);
-            if client.stream.write_all(out.as_bytes()).is_err() {
+            dirty_heap |= client.output.is_some();
+            if client.write_response().is_err()
+                || client.output.as_ref().is_some_and(|out| out.deadline <= Instant::now())
+                || (client.read_eof && client.output.is_none())
+            {
                 closed.push(i);
             }
-            let _ = client.stream.set_nonblocking(true);
         }
-        closed.sort_unstable();
-        closed.dedup();
         for i in closed.into_iter().rev() {
             clients.remove(i);
+        }
+        if rc == 0 && dirty_heap {
+            #[cfg(target_env = "gnu")]
+            unsafe {
+                libc::malloc_trim(0);
+            }
+            dirty_heap = false;
         }
 
         if polling && Instant::now() >= next_retry {
@@ -304,8 +364,9 @@ pub fn serve(cfg: Config) -> Result<(), String> {
             dirty_heap = true;
         }
         if index.generation != saved_generation && last_save.elapsed() > Duration::from_secs(600) {
-            save(&index);
-            saved_generation = index.generation;
+            if save(&index) {
+                saved_generation = index.generation;
+            }
             last_save = Instant::now();
             dirty_heap = true;
         }

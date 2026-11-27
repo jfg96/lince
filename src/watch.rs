@@ -59,6 +59,12 @@ pub struct Applied {
     pub overflow: bool,
 }
 
+#[derive(Default)]
+struct MoveRechecks {
+    subtrees: HashSet<u32>,
+    replacements: HashMap<u32, HashSet<Vec<u8>>>,
+}
+
 impl DirHook for Watcher {
     fn before_read(&self, id: u32, path: &Path) {
         let Ok(c) = CString::new(path.as_os_str().as_bytes()) else { return };
@@ -238,7 +244,12 @@ impl Watcher {
         let kind = match std::fs::symlink_metadata(&path) {
             Ok(m) if m.is_dir() => Kind::Dir,
             Ok(m) if m.is_file() => Kind::File,
-            Ok(_) => return true, // symlink, fifo…: never indexed
+            Ok(_) => {
+                // A rename can put a symlink or special file over an entry
+                // without a separate delete event for the old destination.
+                self.remove(index, dir, name);
+                return true;
+            }
             Err(_) => return false,
         };
         let is_dir = kind == Kind::Dir;
@@ -275,13 +286,34 @@ impl Watcher {
         to: (u32, &[u8]),
         is_dir: bool,
         threads: usize,
-        moved_dirs: &mut HashSet<u32>,
+        recheck: &mut MoveRechecks,
     ) -> bool {
+        // Inotify reports an atomic exchange as two renames. The other
+        // name can be occupied even if it was a symlink we never indexed.
         let source = if index.is_dir(from.0) { index.child_by_name(from.0, &from.1) } else { None };
+        let existing = index.child_by_name(to.0, to.1);
+        let replacements = &mut recheck.replacements;
+        let reconcile = existing.is_some()
+            || replacements.get(&from.0).is_some_and(|names| names.contains(&from.1))
+            || (source.is_some()
+                && std::fs::symlink_metadata(index.path(from.0).join(OsStr::from_bytes(&from.1))).is_ok());
+        if reconcile {
+            replacements.entry(from.0).or_default().insert(from.1.clone());
+            replacements.entry(to.0).or_default().insert(to.1.to_vec());
+            if is_dir || existing.is_some_and(|id| index.is_dir(id)) {
+                // The old directory IDs can now describe the wrong paths.
+                // Stop using their watches until both names are rechecked.
+                if index.is_dir(from.0) {
+                    self.remove(index, from.0, &from.1);
+                }
+                self.remove(index, to.0, to.1);
+                return true;
+            }
+        }
         let Some(id) = source else {
             return self.add(index, to.0, to.1, threads);
         };
-        if let Some(existing) = index.child_by_name(to.0, to.1) {
+        if let Some(existing) = existing {
             if existing != id {
                 let gone = index.remove(existing); // rename(2) replaced it
                 self.forget(&gone);
@@ -296,6 +328,7 @@ impl Watcher {
         if is_dir {
             // If a previously moved ancestor still needs reconciliation,
             // this directory must carry that work to its own destination.
+            let moved_dirs = &mut recheck.subtrees;
             let mut ancestor = from.0;
             while !moved_dirs.is_empty() && ancestor != VROOT && !moved_dirs.contains(&ancestor) {
                 ancestor = index.entries[ancestor as usize].parent;
@@ -324,7 +357,7 @@ impl Watcher {
     fn drain_batch(&mut self, index: &mut Index, threads: usize, applied: &mut Applied) -> bool {
         let mut buf = vec![0u8; 64 * 1024];
         let mut moved_from: HashMap<u32, (u32, Vec<u8>)> = HashMap::new();
-        let mut moved_dirs = HashSet::new();
+        let mut recheck = MoveRechecks::default();
         // Adds that found nothing on disk. If an ancestor was renamed after
         // the entry appeared, the rename's events were queued before the
         // failed stat, so this drain applies them; retrying at the end looks
@@ -372,9 +405,7 @@ impl Watcher {
                     moved_from.insert(ev.cookie, (dir, name.to_vec()));
                 } else if ev.mask & libc::IN_MOVED_TO != 0 {
                     let found = match moved_from.remove(&ev.cookie) {
-                        Some(from) => {
-                            self.rename(index, from, (dir, name), is_dir, threads, &mut moved_dirs)
-                        }
+                        Some(from) => self.rename(index, from, (dir, name), is_dir, threads, &mut recheck),
                         None => self.add(index, dir, name, threads),
                     };
                     if !found {
@@ -401,12 +432,17 @@ impl Watcher {
                 let _ = self.add(index, dir, &name, threads);
             }
         }
-        if moved_dirs.is_empty() {
-            return false;
+        let MoveRechecks { subtrees, replacements } = recheck;
+        let repaired = !replacements.is_empty();
+        if repaired {
+            self.reconcile_replacements(index, replacements, threads);
+        }
+        if subtrees.is_empty() {
+            return repaired;
         }
         // Read the final locations once the whole sequence of moves has
         // been applied. Even unchanged ctimes need new exclusion checks.
-        let mut stack: Vec<u32> = moved_dirs.into_iter().collect();
+        let mut stack: Vec<u32> = subtrees.into_iter().collect();
         let mut seen = HashSet::new();
         let mut dirs = Vec::new();
         while let Some(dir) = stack.pop() {
@@ -420,6 +456,31 @@ impl Watcher {
         persist::refresh_dirs(index, &dirs, threads, self);
         self.commit();
         true
+    }
+
+    fn reconcile_replacements(&mut self, index: &mut Index, replaced: HashMap<u32, HashSet<Vec<u8>>>, threads: usize) {
+        let mut parents: Vec<_> = replaced.into_iter().collect();
+        parents.sort_unstable_by_key(|&(dir, _)| (index.entries[dir as usize].depth, dir));
+        // Release the old directory watches before installing any new ones:
+        // a watched inode may now belong to a different name.
+        for (dir, names) in &parents {
+            if index.is_dir(*dir) {
+                for name in names {
+                    if index.child_by_name(*dir, name).is_some_and(|id| index.is_dir(id)) {
+                        self.remove(index, *dir, name);
+                    }
+                }
+            }
+        }
+        for (dir, names) in parents {
+            if index.is_dir(dir) {
+                for name in &names {
+                    if !self.add(index, dir, name, threads) {
+                        self.remove(index, dir, name);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -445,6 +506,75 @@ mod tests {
 
     fn lookup(index: &Index, rel: &str) -> Option<u32> {
         rel.split('/').try_fold(index.roots[0].id, |dir, part| index.child_by_name(dir, part.as_bytes()))
+    }
+
+    fn exchange(a: &Path, b: &Path) {
+        let a = CString::new(a.as_os_str().as_bytes()).unwrap();
+        let b = CString::new(b.as_os_str().as_bytes()).unwrap();
+        let rc = unsafe {
+            libc::renameat2(libc::AT_FDCWD, a.as_ptr(), libc::AT_FDCWD, b.as_ptr(), libc::RENAME_EXCHANGE)
+        };
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+    }
+
+    #[test]
+    fn exchanges_directories_and_keeps_the_new_paths_watched() {
+        let dir = tempdir::Dir::new();
+        let root = &dir.0;
+        for name in ["a", "b"] {
+            std::fs::create_dir_all(root.join(name).join("sub")).unwrap();
+            std::fs::write(root.join(name).join(format!("{name}.txt")), b"").unwrap();
+        }
+        let mut w = Watcher::new(None).unwrap();
+        let mut index = build(std::slice::from_ref(root), &[], 2, &w).unwrap();
+        w.commit();
+
+        exchange(&root.join("a"), &root.join("b"));
+        w.drain(&mut index, 2);
+        assert!(lookup(&index, "a/b.txt").is_some());
+        assert!(lookup(&index, "b/a.txt").is_some());
+        assert!(lookup(&index, "a/a.txt").is_none());
+        assert!(lookup(&index, "b/b.txt").is_none());
+        assert_eq!(w.watch_count(), 5);
+        assert!(w.fresh());
+        std::fs::write(root.join("b/sub/new.txt"), b"").unwrap();
+        w.drain(&mut index, 2);
+        assert!(lookup(&index, "b/sub/new.txt").is_some());
+
+        // A further move in the same batch can use a watch from one of the
+        // exchanged trees. It must be applied against the final layout.
+        exchange(&root.join("a"), &root.join("b"));
+        std::fs::rename(root.join("a"), root.join("b/sub/relocated")).unwrap();
+        w.drain(&mut index, 2);
+        assert!(lookup(&index, "a").is_none());
+        assert!(lookup(&index, "b/b.txt").is_some());
+        assert!(lookup(&index, "b/sub/relocated/a.txt").is_some());
+        assert!(lookup(&index, "b/sub/relocated/sub/new.txt").is_some());
+        assert_eq!(w.watch_count(), 5);
+        assert!(w.fresh());
+    }
+
+    #[test]
+    fn replacing_a_file_with_a_symlink_removes_the_file_entry() {
+        let dir = tempdir::Dir::new();
+        let root = &dir.0;
+        std::fs::write(root.join("original"), b"").unwrap();
+        let mut w = Watcher::new(None).unwrap();
+        let mut index = build(std::slice::from_ref(root), &[], 1, &w).unwrap();
+        w.commit();
+
+        std::os::unix::fs::symlink("elsewhere", root.join("link")).unwrap();
+        std::fs::rename(root.join("link"), root.join("original")).unwrap();
+        w.drain(&mut index, 1);
+        assert!(lookup(&index, "original").is_none());
+        assert!(w.fresh());
+
+        std::fs::write(root.join("file"), b"").unwrap();
+        w.drain(&mut index, 1);
+        exchange(&root.join("file"), &root.join("original"));
+        w.drain(&mut index, 1);
+        assert!(lookup(&index, "original").is_some());
+        assert!(lookup(&index, "file").is_none());
     }
 
     #[test]

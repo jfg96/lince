@@ -10,11 +10,11 @@
 use unicode_normalization::char::is_combining_mark;
 use unicode_normalization::UnicodeNormalization;
 
-/// Appends the folded form of `name` to `out`.
-pub fn fold_into(name: &[u8], out: &mut Vec<u8>) {
+/// Appends the folded form of `name` to `out` and reports whether the original is UTF-8.
+pub fn fold_into(name: &[u8], out: &mut Vec<u8>) -> bool {
     if name.is_ascii() {
         out.extend(name.iter().map(u8::to_ascii_lowercase));
-        return;
+        return true;
     }
     let text = String::from_utf8_lossy(name);
     let mut buf = [0u8; 4];
@@ -26,6 +26,7 @@ pub fn fold_into(name: &[u8], out: &mut Vec<u8>) {
             out.extend_from_slice(lower.encode_utf8(&mut buf).as_bytes());
         }
     }
+    matches!(text, std::borrow::Cow::Borrowed(_))
 }
 
 pub fn fold(text: &str) -> Vec<u8> {
